@@ -22,6 +22,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 APP_NAME = "NetOpsToolbox"
@@ -154,16 +155,29 @@ def build(debug: bool = False, onefile: bool = True) -> int:
         print(f"\n打包失败，PyInstaller 退出码 {rc}")
         return rc
 
-    exe = os.path.join(out_dir, f"{name}.exe")
-    if not os.path.exists(exe):
-        exe = os.path.join(out_dir, name, f"{name}.exe")   # 单目录模式
-    if os.path.exists(exe):
+    exe = ""
+    for _ in range(20):                      # 杀软/索引器可能短暂占着刚写出来的文件
+        for cand in (os.path.join(out_dir, f"{name}.exe"),
+                     os.path.join(out_dir, name, f"{name}.exe")):   # 后者是单目录模式
+            if os.path.isfile(cand):
+                exe = cand
+                break
+        if exe:
+            break
+        time.sleep(0.25)
+
+    if exe:
         size = os.path.getsize(exe) / 1024 / 1024
         print(f"\n完成：{exe}   （{size:.1f} MB）")
-    else:
-        print("\n打包结束，但没有找到 exe，请检查上面的输出。")
-        return 1
-    return 0
+        return 0
+
+    print(f"\nPyInstaller 正常结束，但 {out_dir} 下没找到 {name}.exe。")
+    try:
+        for entry in sorted(os.listdir(out_dir)):
+            print("   ", entry)
+    except OSError as exc:
+        print(f"    （连目录都读不了：{exc}）")
+    return 1
 
 
 if __name__ == "__main__":
