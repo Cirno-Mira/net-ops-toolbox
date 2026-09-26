@@ -1,0 +1,18 @@
+# 统一换行符，避免 Windows 上提交时到处出现 CRLF 警告
+* text=auto eol=lf
+
+*.py     text eol=lf
+*.md     text eol=lf
+*.txt    text eol=lf
+*.json   text eol=lf
+
+# 批处理 / VBS 启动器保持 Windows 换行
+*.bat    text eol=crlf
+*.cmd    text eol=crlf
+*.vbs    text eol=crlf
+
+# 二进制资源
+*.ico    binary
+*.png    binary
+*.exe    binary
+*.pcap   binary

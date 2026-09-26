@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 打包产物
+build/
+dist/
+dist_debug/
+*.spec
+
+# 运行时生成的文件（不该进版本库）
+config.json
+crash.log
+.running
+certs/
+*.pcap
+*.pcapng
+
+# 编辑器
+.vscode/
+.idea/
+*.swp

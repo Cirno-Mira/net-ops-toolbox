@@ -1,0 +1,24 @@
+# 网络运维工具箱 依赖
+# 安装：pip install -r requirements.txt
+# 国内网络如果默认源慢，加： -i https://mirrors.aliyun.com/pypi/simple/
+
+PyQt5>=5.15                # 界面
+scapy>=2.6                 # ARP 扫描 / ARP 流量牵引 / 抓包（需要配合 Npcap）
+psutil>=5.9                # 网卡枚举
+requests>=2.28             # 公网 IP 查询、HTTP(S) 探测
+mac-vendor-lookup>=0.1.12  # MAC 厂商识别
+dnspython>=2.4             # DNS 记录查询
+zeroconf>=0.100            # mDNS 设备名探测
+cryptography>=41.0         # HTTPS 中间人：动态签发站点证书
+
+# 可选：只有用到对应功能时才需要，缺失时程序照常启动并在界面上给出提示
+paramiko>=3.0              # SSH 弱口令检测、SSH 隧道
+pymysql>=1.1               # MySQL 弱口令检测
+urllib3>=2.0               # 目录爆破时复用连接池、忽略证书告警
+
+# 打包成单文件 exe 时还需要：
+# pyinstaller>=6.0
+
+# 说明：
+# * scapy 收发报文依赖 Npcap（安装 Wireshark 时自带勾选即可）。
+# * 抓包、ARP 牵引、端口探测等功能需要管理员权限，程序启动时会自动请求提权。
