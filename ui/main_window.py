@@ -32,6 +32,7 @@ import theme
 from core import arpmitm as M
 from core import hostinfo as HI
 from core.logging_bus import log
+from core.version import APP_TITLE, APP_VERSION
 from ui.tab_arp import ArpTab
 from ui.tab_assets import AssetsTab
 from ui.tab_capture import CaptureTab
@@ -61,7 +62,7 @@ WORKFLOW_HINT = (
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("网络运维工具箱 · NetOps Toolbox")
+        self.setWindowTitle(f"{APP_TITLE} v{APP_VERSION}")
         self.resize(1400, 920)
         self.setMinimumSize(1000, 680)
 
@@ -130,11 +131,16 @@ class MainWindow(QMainWindow):
 
         col = QVBoxLayout()
         col.setSpacing(1)
+        head = QHBoxLayout()
+        head.setSpacing(8)
         title = QLabel("网络运维工具箱")
         title.setObjectName("H1")
+        head.addWidget(title)
+        head.addWidget(Badge(f"v{APP_VERSION}", "idle"))
+        head.addStretch(1)
         sub = QLabel("资产发现 · 端口扫描 · ARP 牵引/断网 · 流量劫持改包 · 抓包重放 · 运维工具")
         sub.setObjectName("Sub")
-        col.addWidget(title)
+        col.addLayout(head)
         col.addWidget(sub)
         lay.addLayout(col)
         lay.addSpacing(14)

@@ -29,7 +29,7 @@ DEFAULTS: dict = {
     "mitm_https_port": 443,        # 接收被牵引设备的 HTTPS
     "mitm_upstream_proxy": "",     # 二级代理，例如 127.0.0.1:7890（留空=直连）
     "mitm_forward_to_tool": False, # 把流量转交给 Reqable/Fiddler
-    "mitm_forward_port": 8888,     # Reqable 默认 9000，Fiddler 默认 8888
+    "mitm_forward_port": 8888,     # 本地抓包工具的监听端口，填它自己设置里那个
     "mitm_ca_dir": "certs",        # CA 与动态证书存放目录
 
     # DNS 引流

@@ -39,8 +39,7 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-APP_NAME = "NetOpsToolbox"
-APP_ORG = "NetOps"
+from core.version import APP_NAME, APP_ORG, APP_VERSION   # noqa: E402
 
 
 def _fix_stdio() -> None:
@@ -260,6 +259,7 @@ def main() -> int:
     app = QApplication(argv)
     app.setApplicationName(APP_NAME)
     app.setOrganizationName(APP_ORG)
+    app.setApplicationVersion(APP_VERSION)
 
     from core.paths import icon_path
     _icon = icon_path()

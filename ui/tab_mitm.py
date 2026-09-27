@@ -95,7 +95,7 @@ class MitmTab(QWidget):
             "★ 这里是「我方透明代理监听哪个端口」，被 DNS 引流过来的目标会连这个端口。\n"
             "应该保持 80（HTTPS 保持 443）。\n\n"
             "如果你想用 Reqable / Fiddler 来看包，勾选下面的\n"
-            "「把流量转交给本地抓包工具」，把 8888/9000 填到【那一栏】，\n"
+            "「把流量转交给本地抓包工具」，把它自己的监听端口填到【那一栏】，\n"
             "这里仍然保持 80/443 —— 两个端口不是一回事。")
         r1.addWidget(self.sp_http)
         r1.addWidget(label("HTTPS 端口", "Dim"))
@@ -124,7 +124,8 @@ class MitmTab(QWidget):
         self.sp_forward_port = QSpinBox()
         self.sp_forward_port.setRange(1, 65535)
         self.sp_forward_port.setValue(int(appconfig.CFG.get("mitm_forward_port", 8888)))
-        self.sp_forward_port.setToolTip("Reqable 默认 9000，Fiddler 默认 8888")
+        self.sp_forward_port.setToolTip(
+            "填本地抓包工具自己的监听端口（各工具默认值不同，在它设置里能看到）")
         r2.addWidget(self.sp_forward_port)
         r2.addStretch(1)
         btn_ca = QPushButton("导出根证书")
@@ -547,9 +548,9 @@ class MitmTab(QWidget):
             "   点开始。（DNS 引流是关键 —— 没有它，目标的流量只是经过本机，\n"
             "   目的 IP 还是真实服务器，本地代理收不到）\n\n"
             "2) 本页：端口保持 80 / 443，勾上「同时启动内建透明代理」，点「启动代理」。\n"
-            "   注意 80/443 是「目标连过来的端口」，不是 Reqable 的 8888。\n\n"
+            "   注意 80/443 是「目标连过来的端口」，不是抓包工具的监听端口。\n\n"
             "3) 想用 Reqable / Fiddler：勾选「把流量转交给本地抓包工具」，\n"
-            "   把 8888 或 9000 填在【那一栏】，监听端口仍保持 80/443。\n\n"
+            "   把它的监听端口填在【那一栏】，监听端口仍保持 80/443。\n\n"
             "HTTPS 还要多一步：点「导出根证书」，把 netops-ca.crt 装到目标设备的\n"
             "「受信任的根证书颁发机构」里。\n\n"
             "还是没流量？点「🔍 引流自检」，它会告诉你卡在哪一环。\n"

@@ -1,7 +1,7 @@
 # 网络运维工具箱 · NetOps Toolbox
 
-浅色多巴胺风格的 PyQt5 网络运维 / CTF 工具链，一个窗口搞定资产发现、端口扫描、
-ARP 牵引、流量劫持改包、抓包重放。
+**当前版本 v1.0.1** ｜ 浅色多巴胺风格的 PyQt5 网络运维 / CTF 工具链，一个窗口搞定资产发现、
+端口扫描、ARP 牵引、流量劫持改包、抓包重放。
 
 ```
 🎯 资产发现      ARP / Ping 扫描，识别 IP、MAC、厂商、主机名、开放端口
@@ -11,6 +11,28 @@ ARP 牵引、流量劫持改包、抓包重放。
 📡 抓包分析      scapy 实时抓包、落盘 pcap、选中包编辑重放、跳转 Wireshark
 🧰 运维工具      本机信息 / Ping 曲线 / 路由追踪 / DNS / WOL / HTTP / 子网 / 时间
 ```
+
+---
+
+## 界面预览
+
+左侧一棵导航树，右侧内容区，底部常驻运行日志 —— 20 个功能页都平铺在这棵树里，
+点一下即切换。
+
+![资产发现](docs/screenshots/01-assets.png)
+
+几个主要功能页：
+
+| ⚡ ARP 牵引 / 断网 | 🕵 流量劫持 |
+| :---: | :---: |
+| [![ARP 牵引](docs/screenshots/03-arp.png)](docs/screenshots/03-arp.png) | [![流量劫持](docs/screenshots/04-mitm.png)](docs/screenshots/04-mitm.png) |
+| **📡 抓包分析** | **🛡 安全体检** |
+| [![抓包分析](docs/screenshots/05-capture.png)](docs/screenshots/05-capture.png) | [![安全体检](docs/screenshots/09-vuln.png)](docs/screenshots/09-vuln.png) |
+| **🩺 环境自检** | **🔑 哈希与字典** |
+| [![环境自检](docs/screenshots/11-diag.png)](docs/screenshots/11-diag.png) | [![哈希与字典](docs/screenshots/12-hash.png)](docs/screenshots/12-hash.png) |
+
+> 截图是刚启动、还没扫描时的状态；点图片可以看原图。
+> 里面的网卡 IP、网关和 MAC 都已替换成示例值（`192.168.1.x` / `aa:bb:cc:dd:ee:ff`）。
 
 ---
 
@@ -24,7 +46,7 @@ ARP 牵引、流量劫持改包、抓包重放。
 
 ```powershell
 conda activate ai
-cd NetOpsToolbox
+cd net-ops-toolbox
 pip install -r requirements.txt
 
 python main.py          # 启动（会自动弹 UAC 请求管理员权限）
@@ -47,7 +69,7 @@ python main.py --selftest      # 核心层自检，不弹界面
 | --- | --- |
 | `auto_elevate` | 启动是否自动请求管理员（默认 true） |
 | `mitm_http_port` / `mitm_https_port` | 透明代理监听端口（默认 80 / 443） |
-| `mitm_forward_to_tool` / `mitm_forward_port` | 是否把流量转交给 Reqable(9000)/Fiddler(8888) |
+| `mitm_forward_to_tool` / `mitm_forward_port` | 是否把流量转交给本机抓包工具（Reqable / Fiddler / Burp 等）及其监听端口 |
 | `mitm_upstream_proxy` | 二级代理，例如 `127.0.0.1:7890` |
 | `arp_interval` / `arp_restore_count` | ARP 发包间隔、停止时恢复次数 |
 
@@ -89,7 +111,7 @@ python main.py --selftest      # 核心层自检，不弹界面
 - 勾选目标设备 → 点「开始」
 
 **第 2 步 · 流量劫持页**
-- **端口保持 80 / 443**（这是「目标连过来的端口」，**不是** Reqable 的 8888）
+- **端口保持 80 / 443**（这是「目标连过来的端口」，**不是**抓包工具的监听端口）
 - 点「启动代理」
 - 让目标设备打开一个 **http://** 网站（不要用 https，先排除证书问题）
 
@@ -101,7 +123,7 @@ python main.py --selftest      # 核心层自检，不弹界面
 
 | 现象 | 原因 | 解决 |
 | --- | --- | --- |
-| 代理显示在跑，一个包都没有 | **监听端口填成了 8888**（Reqable 占着）。Windows 上 `SO_REUSEADDR` 会让两个进程都绑成功，但连接全被 Reqable 接走 | 监听端口改回 **80 / 443**；想用 Reqable 就勾「转交给本地抓包工具」，把 8888 填到**那一栏** |
+| 代理显示在跑，一个包都没有 | **监听端口填成了别的抓包工具占着的端口**。Windows 上 `SO_REUSEADDR` 会让两个进程都绑成功，但连接全被先绑的那个接走 | 监听端口改回 **80 / 443**；想用抓包工具就勾「转交给本地抓包工具」，把**它自己的**端口填到那一栏 |
 | 有 ARP 流量但代理没反应 | **没开 DNS 引流**。目标的流量只是「经过」本机，目的 IP 还是真实服务器 | 回 ARP 页勾上 DNS 引流，重新开始 |
 | DNS 劫持数是 0 | 目标在用 **DoH / DoT**（加密 DNS），或者它直接用 IP 访问 | 在目标设备上关掉「安全 DNS / DoH」（Chrome：设置→隐私→安全→关闭「使用安全 DNS」），或换用目标 |
 
@@ -110,8 +132,8 @@ python main.py --selftest      # 核心层自检，不弹界面
 
 ### 想继续用 Reqable / Fiddler
 
-在「流量劫持」页勾上 **「把流量转交给本地抓包工具」** 并填它的端口
-（Reqable 默认 9000，Fiddler 默认 8888）。工具箱会把被劫持的连接
+在「流量劫持」页勾上 **「把流量转交给本地抓包工具」** 并填它的监听端口
+（各个工具默认值不一样，在它自己的设置里能看到）。工具箱会把被劫持的连接
 转成代理请求（HTTP 走代理格式、HTTPS 走 CONNECT 隧道）交给它处理。
 **注意：本程序的监听端口仍然是 80/443，两者不是一回事。**
 
@@ -250,13 +272,14 @@ Wake-on-LAN / HTTP(S) 探测（含证书到期）/ 子网计算 / SNTP 时间校
 ## 五、目录结构
 
 ```
-NetOpsToolbox/
+net-ops-toolbox/
 ├── main.py                 入口（启动自动提权 / 异常兜底 / --selftest）
 ├── 启动.vbs                无控制台窗口启动器
 ├── build_exe.py            一键打包单文件 exe
 ├── theme.py                配色与 QSS
 ├── config.json             配置（首次运行生成）
 ├── assets/                 图标资源（app.ico / app.png）
+├── docs/screenshots/       README 里的界面截图
 ├── certs/                  MITM 根证书与动态站点证书（首次运行生成）
 ├── requirements.txt
 ├── selftest_core.py        核心层自检
@@ -264,6 +287,7 @@ NetOpsToolbox/
 ├── tools/
 │   └── make_icon.py        生成 assets/app.ico
 ├── core/                   与界面无关的核心逻辑
+│   ├── version.py          程序名与版本号（升版本只改这里）
 │   ├── paths.py            路径解析（源码运行 / exe 运行都适用）
 │   ├── hostinfo.py         网卡/网关/子网/权限/提权
 │   ├── assets.py           资产发现

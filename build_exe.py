@@ -133,8 +133,8 @@ def build(debug: bool = False, onefile: bool = True) -> int:
 
     bin_dir = _conda_bin()
     if bin_dir:
-        for name in CONDA_DLLS:
-            src = os.path.join(bin_dir, name)
+        for dll in CONDA_DLLS:          # 别用 name：它是 exe 文件名，会被覆盖掉
+            src = os.path.join(bin_dir, dll)
             if os.path.exists(src):
                 cmd += ["--add-binary", f"{src}{os.pathsep}."]
 
