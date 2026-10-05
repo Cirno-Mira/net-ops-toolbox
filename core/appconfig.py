@@ -35,6 +35,10 @@ DEFAULTS: dict = {
     # DNS 引流
     "dns_spoof": True,             # 把被牵引设备的 DNS 应答指向本机
 
+    # DNS 查询页：多服务器对比里用户自己填的那串服务器
+    # （不在 DEFAULTS 里的键会在 load() 时被丢掉，所以这里必须占一行）
+    "dns_multi_servers": "",
+
     # 界面
     "font_pt": 10,
     "confirm_arp_start": True,

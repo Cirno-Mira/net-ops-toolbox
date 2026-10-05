@@ -16,4 +16,4 @@ from __future__ import annotations
 APP_NAME = "NetOpsToolbox"
 APP_ORG = "NetOps"
 APP_TITLE = "网络运维工具箱 · NetOps Toolbox"
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.1.0"

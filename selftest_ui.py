@@ -131,8 +131,11 @@ win.show()
 app.processEvents()
 check("左侧导航树有分组", win.nav.topLevelItemCount() >= 4,
       str(win.nav.topLevelItemCount()))
-check("所有工具都进了页面栈（20 个）", win.stack.count() == 20,
-      str(win.stack.count()))
+# 页面数会随功能增加，所以这里比对「导航叶子项数」和「页面栈」，不写死具体数字
+_nav_leaves = sum(win.nav.topLevelItem(i).childCount()
+                  for i in range(win.nav.topLevelItemCount()))
+check("导航里的每个工具都有对应页面", win.stack.count() == _nav_leaves,
+      f"页面 {win.stack.count()} / 导航 {_nav_leaves}")
 
 
 def _nav_titles():
@@ -147,7 +150,8 @@ def _nav_titles():
 titles = " ".join(_nav_titles())
 for want in ("资产发现", "端口扫描", "目录爆破", "ARP", "流量劫持", "穿透隧道",
              "假服务", "安全体检", "报告导出", "抓包", "环境自检", "哈希",
-             "本机信息", "Ping", "路由追踪", "DNS", "网络唤醒", "HTTP", "子网", "时间"):
+             "本机信息", "Ping", "路由追踪", "DNS", "网络唤醒", "HTTP", "子网", "时间",
+             "压力"):
     check(f"导航里有「{want}」", want in titles)
 check("导航里没有点不动的空项",
       all(win.nav.topLevelItem(i).child(j).data(0, Qt.UserRole) is not None

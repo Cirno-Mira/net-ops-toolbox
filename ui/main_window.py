@@ -36,6 +36,7 @@ from core.version import APP_TITLE, APP_VERSION
 from ui.tab_arp import ArpTab
 from ui.tab_assets import AssetsTab
 from ui.tab_capture import CaptureTab
+from ui.tab_dhcp import DhcpTab
 from ui.tab_diag import DiagTab
 from ui.tab_dirbrute import DirBruteTab
 from ui.tab_fakeserv import FakeservTab
@@ -43,6 +44,7 @@ from ui.tab_hash import HashTab
 from ui.tab_mitm import MitmTab
 from ui.tab_ports import PortsTab
 from ui.tab_report import ReportTab
+from ui.tab_stress import StressTab
 from ui.tab_tools import ToolsTab
 from ui.tab_tunnel import TunnelTab
 from ui.tab_vuln import VulnTab
@@ -110,7 +112,7 @@ class MainWindow(QMainWindow):
         for page in (self.tab_arp, self.tab_mitm, self.tab_capture,
                      self.tab_tunnel, self.tab_fakeserv, self.tab_vuln,
                      self.tab_dirbrute, self.tab_hash, self.tab_assets,
-                     self.tab_ports):
+                     self.tab_ports, self.tab_stress, self.tab_dhcp):
             page.note_action = self.note_action
         self.show_page(self.tab_assets)
         log("网络运维工具箱已启动", "success", "app")
@@ -138,7 +140,7 @@ class MainWindow(QMainWindow):
         head.addWidget(title)
         head.addWidget(Badge(f"v{APP_VERSION}", "idle"))
         head.addStretch(1)
-        sub = QLabel("资产发现 · 端口扫描 · ARP 牵引/断网 · 流量劫持改包 · 抓包重放 · 运维工具")
+        sub = QLabel("资产发现 · 端口扫描 · ARP 牵引/断网 · 流量劫持改包 · 压力测试 · 抓包重放 · 运维工具")
         sub.setObjectName("Sub")
         col.addLayout(head)
         col.addWidget(sub)
@@ -185,6 +187,8 @@ class MainWindow(QMainWindow):
         self.tab_vuln = VulnTab()
         self.tab_report = ReportTab()
         self.tab_hash = HashTab()
+        self.tab_stress = StressTab()
+        self.tab_dhcp = DhcpTab()
 
         self.stack = QStackedWidget()
 
@@ -215,6 +219,12 @@ class MainWindow(QMainWindow):
                  "端口转发（TCP/UDP）+ 正/反向 shell 交互控制台"),
                 ("🎭 假服务", self.tab_fakeserv,
                  "一键起 DNS / HTTP 服务，配合引流做取证演示"),
+                ("🎣 DHCP 测试", self.tab_dhcp,
+                 "被动审计局域网 DHCP 分配 + 地址池耗尽测试 + 假 DHCP 服务器"),
+            ]),
+            ("🔥 压力测试", [
+                ("🌊 连接数与流量压力", self.tab_stress,
+                 "并发 TCP 连接数测试 + TCP/UDP/ICMP/HTTP 压力 + Slowloris 慢速连接"),
             ]),
             ("🛡 检测与报告", [
                 ("🛡 安全体检", self.tab_vuln,
@@ -396,7 +406,9 @@ class MainWindow(QMainWindow):
                          ("透明代理", self.tab_mitm.shutdown),
                          ("抓包", self.tab_capture.shutdown),
                          ("穿透隧道", getattr(self.tab_tunnel, "shutdown", None)),
-                         ("假服务", getattr(self.tab_fakeserv, "shutdown", None))):
+                         ("假服务", getattr(self.tab_fakeserv, "shutdown", None)),
+                         ("压力测试", getattr(self.tab_stress, "shutdown", None)),
+                         ("DHCP 测试", getattr(self.tab_dhcp, "shutdown", None))):
             if fn is None:
                 continue
             try:
@@ -408,7 +420,7 @@ class MainWindow(QMainWindow):
         pages = [self.tab_assets, self.tab_ports, self.tab_vuln,
                  self.tab_dirbrute, self.tab_hash, self.tab_tools,
                  self.tab_arp, self.tab_mitm, self.tab_capture,
-                 self.tab_tunnel, self.tab_fakeserv]
+                 self.tab_tunnel, self.tab_fakeserv, self.tab_stress]
         for page in pages:
             for meth in ("stop_scan", "stop_all", "stop", "stop_worker"):
                 fn = getattr(page, meth, None)

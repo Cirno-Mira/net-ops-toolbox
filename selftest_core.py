@@ -305,7 +305,17 @@ check("severity 排序表完整",
 # --- 端口转发：真的转一次 ---
 import http.server as _http      # noqa: E402
 import threading as _th          # noqa: E402
+import socket as _sock           # noqa: E402
 import requests as _rq           # noqa: E402
+
+
+def _free_port() -> int:
+    """要一个当前空闲的端口，别写死——写死容易撞上别的程序或上次跑剩的监听。"""
+    _s = _sock.socket()
+    _s.bind(("127.0.0.1", 0))
+    _p = _s.getsockname()[1]
+    _s.close()
+    return _p
 
 
 class _H(_http.BaseHTTPRequestHandler):
@@ -320,18 +330,29 @@ class _H(_http.BaseHTTPRequestHandler):
         pass
 
 
-_back = _http.ThreadingHTTPServer(("127.0.0.1", 19001), _H)
+_back_port, _fwd_port = _free_port(), _free_port()
+_back = _http.ThreadingHTTPServer(("127.0.0.1", _back_port), _H)
 _th.Thread(target=_back.serve_forever, daemon=True).start()
-_fwd = TN.TcpForwarder(1, "127.0.0.1", 19002, "127.0.0.1", 19001)
+_fwd = TN.TcpForwarder(1, "127.0.0.1", _fwd_port, "127.0.0.1", _back_port)
 _fwd.start()
-_time.sleep(0.6)
-try:
-    _r = _rq.get("http://127.0.0.1:19002/x", timeout=5)
+
+# 转发器是后台线程，起监听要一点时间。这里重试几次再下结论，
+# 否则机器一忙就会偶发 ReadTimeout，把好代码误判成坏的。
+_r = None
+_last = ""
+for _try in range(12):
+    _time.sleep(0.25)
+    try:
+        _r = _rq.get(f"http://127.0.0.1:{_fwd_port}/x", timeout=3)
+        break
+    except Exception as _e:
+        _last = f"{type(_e).__name__}: {_e}"
+if _r is not None:
     check("TCP 端口转发可用", _r.status_code == 200 and b"FORWARD-OK" in _r.content,
           str(_r.status_code))
     check("转发统计有连接数", _fwd.stat.conns >= 1, str(_fwd.stat.conns))
-except Exception as _e:
-    check("TCP 端口转发可用", False, f"{type(_e).__name__}: {_e}")
+else:
+    check("TCP 端口转发可用", False, _last)
 _fwd.stop()
 _back.shutdown()
 check("转发可正常停止", not _fwd.is_alive())
@@ -378,6 +399,419 @@ BUS.subscribe(lambda lvl, src, txt, ts: got.append((lvl, src, txt)))
 log("测试消息", "warn", "selftest")
 check("订阅收到消息", got == [("warn", "selftest", "测试消息")], str(got))
 
+# --------------------------------------------------------------------------- #
+section("12. 压力测试核心（对着本机临时服务跑）")
+
+from core import stress as ST          # noqa: E402
+import socket as _sk                  # noqa: E402
+import threading as _thr              # noqa: E402
+
+# ---- 目标解析 / 速率解析 ----
+_ips, _note = ST.resolve_target("127.0.0.1")
+check("压力测试：解析单个 IP", _ips == ["127.0.0.1"], _note)
+_ips, _note = ST.resolve_target("localhost")
+check("压力测试：解析域名", bool(_ips) and _ips[0].startswith("127."), _note)
+_ips, _note = ST.resolve_target("")
+check("压力测试：空目标给提示而不抛异常", _ips == [] and "填" in _note, _note)
+check("压力测试：parse_rate('1k')", ST.parse_rate("1k") == 1000)
+check("压力测试：parse_rate('2M')", ST.parse_rate("2M") == 2000000)
+check("压力测试：parse_rate('') 表示不限速", ST.parse_rate("") == 0)
+check("压力测试：六种压测器都注册了", len(ST.KINDS) == 6, str(sorted(ST.KINDS)))
+
+# ---- 起本机 TCP 靶子 ----
+# 两种靶子：hold=True 的把连接留着（连接数测试/慢速连接要的就是「挂着」），
+# hold=False 的一收到就关掉（connect 洪泛只关心握手成不成，留着的 socket
+# 会在测试进程里堆到上千个，把后面的用例拖垮）。
+_held = []
+
+
+def _srv(box, stop_evt, hold=True):
+    s = _sk.socket(_sk.AF_INET, _sk.SOCK_STREAM)
+    s.setsockopt(_sk.SOL_SOCKET, _sk.SO_REUSEADDR, 1)
+    s.bind(("127.0.0.1", 0))
+    s.listen(512)
+    s.settimeout(0.2)
+    box.append(s.getsockname()[1])
+    while not stop_evt.is_set():
+        try:
+            c, _ = s.accept()
+        except (_sk.timeout, OSError):
+            continue
+        if hold:
+            _held.append(c)
+        else:
+            try:
+                c.close()
+            except OSError:
+                pass
+    try:
+        s.close()
+    except OSError:
+        pass
+
+
+def _start_srv(hold=True):
+    box, stop_evt = [], _thr.Event()
+    _thr.Thread(target=_srv, args=(box, stop_evt, hold), daemon=True).start()
+    for _ in range(100):
+        if box:
+            break
+        _time.sleep(0.05)
+    return box[0] if box else 0, stop_evt
+
+
+_TPORT, _stop = _start_srv(hold=True)          # 连接数测试 / 慢速连接用
+_SINK, _sink_stop = _start_srv(hold=False)     # connect 洪泛用
+check("压力测试：本机靶子服务已就绪", _TPORT > 0 and _SINK > 0,
+      f"hold={_TPORT} sink={_SINK}")
+
+# ---- 连接数测试 ----
+_ss = ST.TcpSessionTest(["127.0.0.1"], _TPORT, connections=40, threads=8,
+                        check_interval=1.0, duration=1.5)
+check("连接数测试：start() 成功", _ss.start() is True)
+_time.sleep(0.9)
+_snap = _ss.snapshot()
+check("连接数测试：确实挂上了连接", _snap["active"] > 5,
+      f"active={_snap['active']} peak={_snap['peak_active']}")
+check("连接数测试：统计在累计", _snap["sent"] > 5 and _snap["ok"] > 5,
+      f"sent={_snap['sent']} ok={_snap['ok']}")
+check("连接数测试：记录了建连耗时", _snap["rtt_avg_ms"] > 0,
+      f"{_snap['rtt_avg_ms']:.2f}ms")
+check("连接数测试：运行中重复 start 返回 False", _ss.start() is False)
+_t0 = _time.time()
+_ss.stop()
+check("连接数测试：stop() 及时返回", _time.time() - _t0 < 6.0,
+      f"{_time.time() - _t0:.2f}s")
+check("连接数测试：stop() 后不再运行", not _ss.is_running())
+check("连接数测试：stop() 后 active 归零", _ss.snapshot()["active"] == 0,
+      f"active={_ss.snapshot()['active']}")
+_time.sleep(0.3)          # 让刚关掉的 socket 缓一下，别把端口/backlog 压力带到下一项
+
+# ---- TCP connect 压力（打到 sink 靶子，不留 socket）----
+_tf = ST.TcpFlood(["127.0.0.1"], _SINK, mode="connect", threads=4, duration=1.2)
+_tf.start()
+_time.sleep(0.8)
+_snap = _tf.snapshot()
+check("TCP 压力：在发包", _snap["sent"] > 3, f"sent={_snap['sent']}")
+# 本地靶子的 backlog 很小，被压满之后 connect 会失败——这是**预期**的，
+# 所以这里只要求「确实建上过」，不要求零失败；失败原因必须是可解释的
+check("TCP 压力：至少建上过连接", _snap["ok"] > 0, f"ok={_snap['ok']}")
+check("TCP 压力：失败数不超过发送数", _snap["fail"] <= _snap["sent"],
+      f"fail={_snap['fail']} sent={_snap['sent']}")
+check("TCP 压力：失败原因可读", all(isinstance(k, str) and k for k, _ in _snap["errors"]),
+      str(_snap["errors"]))
+_tf.stop()
+_time.sleep(0.3)
+
+# ---- UDP 压力 ----
+_udp = _sk.socket(_sk.AF_INET, _sk.SOCK_DGRAM)
+_udp.bind(("127.0.0.1", 0))
+_uf = ST.UdpFlood(["127.0.0.1"], _udp.getsockname()[1], threads=2,
+                  duration=1.2, payload_size=64)
+_uf.start()
+_time.sleep(0.8)
+_snap = _uf.snapshot()
+check("UDP 压力：在发且统计了字节", _snap["sent"] > 3 and
+      _snap["bytes_out"] >= _snap["sent"] * 64,
+      f"sent={_snap['sent']} bytes={_snap['bytes_out']}")
+_uf.stop()
+_udp.close()
+
+# ---- Slowloris（单独起一个靶子，别和第二三手压测挤同一个 backlog）----
+_slow_port, _slow_stop = _start_srv(hold=True)
+_sl = ST.Slowloris(["127.0.0.1"], _slow_port, connections=20, threads=3,
+                   keepalive=1.0, duration=4.0)
+_sl.start()
+_snap = {}
+for _ in range(20):                    # 最多等 4 秒，等它真挂上为止
+    _time.sleep(0.2)
+    _snap = _sl.snapshot()
+    if _snap["active"] > 3:
+        break
+check("Slowloris：挂住了连接", _snap.get("active", 0) > 3,
+      f"active={_snap.get('active')} errors={_snap.get('errors')}")
+_sl.stop()
+check("Slowloris：停止后 active 归零", _sl.snapshot()["active"] == 0)
+_slow_stop.set()
+
+# ---- 错误路径 ----
+_bad = ST.TcpSessionTest(["127.0.0.1"], 1, connections=3, threads=2,
+                         connect_timeout=0.3, check_interval=1.0, duration=1.0)
+_bad.start()
+_time.sleep(0.7)
+_snap = _bad.snapshot()
+check("压力测试：连不上时记失败而不是抛异常", _snap["fail"] > 0, f"fail={_snap['fail']}")
+check("压力测试：失败原因被归类", bool(_snap["errors"]), str(_snap["errors"]))
+_bad.stop()
+check("压力测试：没有目标时 start 返回 False",
+      ST.TcpSessionTest([], 80, duration=1.0).start() is False)
+ST.TcpSessionTest([], 80).stop()
+check("压力测试：没启动过也能安全 stop", True)
+check("压力测试：本机端口占用能读出来",
+      isinstance(ST.local_port_usage(), dict))
+
+_stop.set()
+_sink_stop.set()
+for _c in _held:
+    try:
+        _c.close()
+    except OSError:
+        pass
+_held.clear()
+
+# --------------------------------------------------------------------------- #
+section("13. 子网计算 / 划分 / 汇总")
+
+from core import subnet as SN          # noqa: E402
+
+_d = SN.describe("192.168.5.0/24")
+# 注意 check(label, ok, extra) 第二个参数是「布尔判断」，不是期望值，
+# 所以这里一律写成显式比较，避免出现「传了个非零值就算过」的假通过。
+check("子网：网络地址", _d["network"] == "192.168.5.0", _d["network"])
+check("子网：掩码与通配符",
+      (_d["netmask"], _d["wildcard"]) == ("255.255.255.0", "0.0.0.255"),
+      f'{_d["netmask"]} / {_d["wildcard"]}')
+check("子网：广播地址", _d["broadcast"] == "192.168.5.255", _d["broadcast"])
+check("子网：可用范围",
+      (_d["first"], _d["last"]) == ("192.168.5.1", "192.168.5.254"),
+      f'{_d["first"]} ~ {_d["last"]}')
+check("子网：可用主机数 254", _d["usable"] == 254, str(_d["usable"]))
+check("子网：地址总数 256", _d["total"] == 256, str(_d["total"]))
+check("子网：反查区名", _d["reverse_zone"] == "5.168.192.in-addr.arpa",
+      _d["reverse_zone"])
+check("子网：识别为 RFC1918 私有段", "私有地址" in _d["reserved"], _d["reserved"])
+check("子网：二进制掩码",
+      _d["binary_mask"] == "11111111.11111111.11111111.00000000",
+      _d["binary_mask"])
+check("子网：地址类别是 C 类", _d["addr_class"].startswith("C 类"), _d["addr_class"])
+check("子网：十六进制表示", _d["hex"] == "0xC0A80500", _d["hex"])
+_public = SN.describe("8.8.8.0/24")
+check("子网：公网段不报保留", "公网可路由" in _public["reserved"], _public["reserved"])
+check("子网：/31 两端都可用", SN.describe("10.0.0.0/31")["usable"] == 2,
+      str(SN.describe("10.0.0.0/31")["usable"]))
+check("子网：/32 也算一个可用地址",
+      SN.describe("10.0.0.7/32")["usable"] == 1)
+
+# 解析容错
+check("子网：主机位按掩码收起",
+      str(SN.parse_target("192.168.1.5/24")) == "192.168.1.0/24")
+check("子网：单个 IP 当 /32",
+      str(SN.parse_target("192.168.1.5")) == "192.168.1.5/32")
+check("子网：支持点分掩码写法",
+      str(SN.parse_target("192.168.1.0 255.255.255.0")) == "192.168.1.0/24")
+
+# 切分
+_nets = SN.split("192.168.1.0/24", 26)
+check("子网：按 /26 切成 4 段",
+      [str(n) for n in _nets] == ["192.168.1.0/26", "192.168.1.64/26",
+                                  "192.168.1.128/26", "192.168.1.192/26"],
+      str([str(n) for n in _nets]))
+_pfx, _nets = SN.split_by_count("10.0.0.0/24", 5)
+check("子网：要 5 个会自动选 /27 并给 8 个", (_pfx, len(_nets)) == (27, 8),
+      f"/{_pfx} x{len(_nets)}")
+try:
+    SN.split("0.0.0.0/0", 24)
+    check("子网：超大划分会被拦住", False, "没有抛异常")
+except ValueError as _exc:
+    check("子网：超大划分会被拦住", "上限" in str(_exc), str(_exc)[:40])
+
+# VLSM
+_v = SN.vlsm("192.168.10.0/24",
+             [("办公区", 100), ("监控", 50), ("核心", 10), ("互联", 2)])
+check("VLSM：四段都排下了", len(_v) == 4 and all(not r["error"] for r in _v),
+      str([r["error"] for r in _v]))
+_by = {r["name"]: r for r in _v}
+check("VLSM：100 台分到 /25", _by.get("办公区", {}).get("cidr") == "192.168.10.0/25",
+      str(_by.get("办公区")))
+check("VLSM：50 台分到 /26", _by.get("监控", {}).get("cidr") == "192.168.10.128/26",
+      str(_by.get("监控")))
+check("VLSM：10 台分到 /28", _by.get("核心", {}).get("cidr") == "192.168.10.192/28",
+      str(_by.get("核心")))
+check("VLSM：2 台分到 /30", _by.get("互联", {}).get("cidr") == "192.168.10.208/30",
+      str(_by.get("互联")))
+_all = [r["cidr"] for r in _v]
+check("VLSM：分配的网段互不重复", len(_all) == len(set(_all)), str(_all))
+check("VLSM：每段都装得下需求",
+      all(r["usable"] >= r["need"] for r in _v),
+      str([(r["name"], r["usable"], r["need"]) for r in _v]))
+_bad = SN.vlsm("192.168.10.0/28", [("大段", 200)])
+check("VLSM：空间不够时给错误而不是抛异常",
+      bool(_bad and _bad[0]["error"]), str(_bad[0]["error"] if _bad else ""))
+
+# 汇总 / 区间
+check("汇总：两个 /25 并回一个 /24",
+      [str(n) for n in SN.summarize(["192.168.0.0/25", "192.168.0.128/25"])]
+      == ["192.168.0.0/24"])
+check("汇总：不相邻的不硬并",
+      len(SN.summarize(["10.1.0.0/16", "10.9.0.0/16"])) == 2)
+_cidrs = SN.range_to_cidrs("10.0.0.5", "10.0.0.200")
+check("区间转 CIDR：条数合理", 3 <= len(_cidrs) <= 12, str(len(_cidrs)))
+check("区间转 CIDR：边界正确",
+      (str(_cidrs[0].network_address), str(_cidrs[-1].broadcast_address))
+      == ("10.0.0.5", "10.0.0.200"),
+      f"{_cidrs[0]} .. {_cidrs[-1]}")
+check("区间转 CIDR：首尾对调也能算",
+      len(SN.range_to_cidrs("10.0.0.200", "10.0.0.5")) == len(_cidrs))
+check("包含判断：网段内的 IP",
+      SN.contains("192.168.1.0/24", "192.168.1.99") is True)
+check("包含判断：网段外的 IP",
+      SN.contains("192.168.1.0/24", "192.168.2.99") is False)
+check("包含判断：子网也算包含",
+      SN.contains("192.168.0.0/16", "192.168.3.0/24") is True)
+check("包含判断：乱填不抛异常只返回 False",
+      SN.contains("192.168.1.0/24", "不是IP") is False)
+check("同网段判断：同 /24",
+      SN.same_subnet("192.168.1.10", "192.168.1.200", 24) is True)
+check("同网段判断：跨 /24",
+      SN.same_subnet("192.168.1.10", "192.168.2.200", 24) is False)
+
+# --------------------------------------------------------------------------- #
+section("14. DHCP 组包 / 解析（只构造与解析，不发送）")
+
+from core import dhcpx as DX           # noqa: E402
+
+_mac = DX.random_mac("02:00:00")
+check("DHCP：随机 MAC 带指定前缀", _mac.startswith("02:00:00"), _mac)
+check("DHCP：随机 MAC 长度是 17", len(_mac) == 17, _mac)
+check("DHCP：随机 MAC 每次都不一样", DX.random_mac() != DX.random_mac())
+check("DHCP：MAC 规范化", DX.normalize_mac("AA-BB-CC-DD-EE-FF") == "aa:bb:cc:dd:ee:ff",
+      DX.normalize_mac("AA-BB-CC-DD-EE-FF"))
+check("DHCP：全零 MAC 不可用", DX.has_usable_mac("00:00:00:00:00:00") is False)
+check("DHCP：正常 MAC 可用", DX.has_usable_mac("02:00:00:11:22:33") is True)
+
+_pool = DX.parse_pool("192.168.9.100-192.168.9.120")
+check("DHCP：地址池区间解析出 21 个", len(_pool) == 21, str(len(_pool)))
+check("DHCP：地址池首尾正确", (_pool[0], _pool[-1]) == ("192.168.9.100", "192.168.9.120"),
+      f"{_pool[0]} ~ {_pool[-1]}")
+_pool2 = DX.parse_pool("192.168.9.0/29")
+check("DHCP：地址池按网段展开会去掉网络号与广播号（/29 -> 6 个）",
+      len(_pool2) == 6, str(len(_pool2)))
+check("DHCP：/29 首尾是 .1 和 .6",
+      (_pool2[0], _pool2[-1]) == ("192.168.9.1", "192.168.9.6"),
+      f"{_pool2[0]} ~ {_pool2[-1]}")
+
+# DISCOVER 往返
+_disc = DX.build_discover(_mac, xid=0x12345678, hostname="selftest-host")
+_info = DX.parse_dhcp(_disc)
+check("DHCP：DISCOVER 能被解析回来", bool(_info), str(_info)[:80])
+check("DHCP：DISCOVER 的客户端 MAC 一致",
+      _info.get("client_mac") == _mac, str(_info.get("client_mac")))
+check("DHCP：DISCOVER 的 xid 一致", _info.get("xid") == 0x12345678,
+      str(_info.get("xid")))
+check("DHCP：DISCOVER 被认成 discover",
+      str(_info.get("msg_type", "")).lower().startswith("discover"),
+      str(_info.get("msg_type")))
+check("DHCP：DISCOVER 主机名带出去了",
+      _info.get("hostname") == "selftest-host", str(_info.get("hostname")))
+check("DHCP：DISCOVER 的二层源 MAC 就是指定 MAC",
+      str(_disc["Ether"].src).lower() == _mac, str(_disc["Ether"].src))
+check("DHCP：DISCOVER 是广播", str(_disc["Ether"].dst).lower()
+      in ("ff:ff:ff:ff:ff:ff", "ff:ff:ff:ff:ff:ff".upper()),
+      str(_disc["Ether"].dst))
+
+# OFFER 往返
+_srv_mac = DX.random_mac("02:00:01")
+_offer = DX.build_offer(_mac, 0x12345678, "192.168.9.55", "192.168.9.1",
+                        _srv_mac, router="192.168.9.1", dns=["223.5.5.5"])
+_oi = DX.parse_dhcp(_offer)
+check("DHCP：OFFER 能被解析回来", bool(_oi), str(_oi)[:80])
+check("DHCP：OFFER 分配的地址正确",
+      _oi.get("assigned_ip") == "192.168.9.55", str(_oi.get("assigned_ip")))
+check("DHCP：OFFER 的服务器地址正确",
+      _oi.get("server_ip") == "192.168.9.1", str(_oi.get("server_ip")))
+check("DHCP：OFFER 的客户端 MAC 正确",
+      _oi.get("client_mac") == _mac, str(_oi.get("client_mac")))
+check("DHCP：OFFER 被认成 offer",
+      str(_oi.get("msg_type", "")).lower().startswith("offer"),
+      str(_oi.get("msg_type")))
+_ack = DX.build_ack(_mac, 0x12345678, "192.168.9.55", "192.168.9.1", _srv_mac)
+check("DHCP：ACK 也能构造并解析",
+      str(DX.parse_dhcp(_ack).get("msg_type", "")).lower().startswith("ack"),
+      str(DX.parse_dhcp(_ack).get("msg_type")))
+
+# 拒绝无效输入
+try:
+    DX.build_discover("00:00:00:00:00:00")
+    check("DHCP：全零源 MAC 组包会被拒绝", False, "没有抛异常")
+except ValueError as _exc:
+    check("DHCP：全零源 MAC 组包会被拒绝", "MAC" in str(_exc), str(_exc)[:40])
+try:
+    DX.build_offer(_mac, 1, "192.168.9.55", "192.168.9.1", "00:00:00:00:00:00")
+    check("DHCP：服务器 MAC 为全零也会被拒绝", False, "没有抛异常")
+except ValueError as _exc:
+    check("DHCP：服务器 MAC 为全零也会被拒绝", "MAC" in str(_exc), str(_exc)[:40])
+
+# 非 DHCP 包不能误判
+from scapy.all import IP as _IP, TCP as _TCP, UDP as _UDP   # noqa: E402
+check("DHCP：普通 TCP 包返回空", DX.parse_dhcp(_IP() / _TCP()) == {})
+check("DHCP：非 67/68 的 UDP 包返回空",
+      DX.parse_dhcp(_IP() / _UDP(sport=1234, dport=1235)) == {})
+_ok, _why = DX.dhcp_available(need_send=True)
+check("DHCP：可用性检查返回 (bool, 原因)", isinstance(_ok, bool) and isinstance(_why, str),
+      f"{_ok} / {_why[:50]}")
+
+# --------------------------------------------------------------------------- #
+section("15. 多服务器 DNS 对比（不依赖外网也能验证的比较逻辑）")
+
+check("DNS：内置了若干预设组", len(T.DNS_PRESETS) >= 3, str(list(T.DNS_PRESETS)))
+check("DNS：预设里有「国内公共」", "国内公共" in T.DNS_PRESETS)
+check("DNS：预设里有「国际公共」", "国际公共" in T.DNS_PRESETS)
+check("DNS：每个预设都非空",
+      all(v for v in T.DNS_PRESETS.values()),
+      str({k: len(v) for k, v in T.DNS_PRESETS.items()}))
+check("DNS：常见服务器有友好名", "阿里" in T.label_for("223.5.5.5"), T.label_for("223.5.5.5"))
+check("DNS：不认识的服务器退回 IP 本身",
+      T.label_for("203.0.113.9") == "203.0.113.9", T.label_for("203.0.113.9"))
+
+check("DNS：解析服务器字符串", T.parse_dns_servers("223.5.5.5, 8.8.8.8") ==
+      ["223.5.5.5", "8.8.8.8"], str(T.parse_dns_servers("223.5.5.5, 8.8.8.8")))
+check("DNS：去重且保序",
+      T.parse_dns_servers("8.8.8.8 223.5.5.5 8.8.8.8") == ["8.8.8.8", "223.5.5.5"],
+      str(T.parse_dns_servers("8.8.8.8 223.5.5.5 8.8.8.8")))
+check("DNS：支持 IPv6 字面量",
+      T.parse_dns_servers("2400:3200::1") == ["2400:3200::1"],
+      str(T.parse_dns_servers("2400:3200::1")))
+try:
+    T.parse_dns_servers("223.5.5.5, 这不是IP")
+    check("DNS：非法条目直接报错而不是静默丢弃", False, "没有抛异常")
+except ValueError as _exc:
+    check("DNS：非法条目直接报错而不是静默丢弃", "不是合法" in str(_exc), str(_exc)[:50])
+
+# 一致性比较：用造出来的结果，不联网
+_same = [{"server": f"10.0.0.{i}", "ok": True, "records": ["1.2.3.4"], "status": "正常"}
+         for i in (1, 2, 3)]
+_r = T.dns_consistency(_same)
+check("DNS：三台一致时 consistent=True", _r["consistent"] is True, str(_r["verdict"]))
+check("DNS：三台一致时只有一组", len(_r["groups"]) == 1, str(len(_r["groups"])))
+
+_diff = _same[:2] + [{"server": "10.0.0.9", "ok": True, "records": ["9.9.9.9"],
+                      "status": "正常"}]
+_r2 = T.dns_consistency(_diff)
+check("DNS：有分歧时 consistent=False", _r2["consistent"] is False, str(_r2["verdict"]))
+check("DNS：多数派被认出来", _r2["majority_servers"] == ["10.0.0.1", "10.0.0.2"],
+      str(_r2["majority_servers"]))
+check("DNS：少数派被标出来", _r2["disagree_servers"] == ["10.0.0.9"],
+      str(_r2["disagree_servers"]))
+
+_rr = [{"server": "a", "ok": True, "records": ["1.1.1.1", "2.2.2.2"], "status": "正常"},
+       {"server": "b", "ok": True, "records": ["2.2.2.2", "1.1.1.1"], "status": "正常"}]
+check("DNS：轮询导致的顺序不同不算分歧",
+      T.dns_consistency(_rr)["consistent"] is True,
+      str(T.dns_consistency(_rr)["verdict"]))
+
+_dead = [{"server": "a", "ok": False, "records": [], "status": "超时", "error": "timeout"},
+         {"server": "b", "ok": True, "records": ["1.1.1.1"], "status": "正常"}]
+_r3 = T.dns_consistency(_dead)
+check("DNS：全挂时给明确结论",
+      "全部" in T.dns_consistency(
+          [{"server": "a", "ok": False, "records": [], "status": "超时"}])["verdict"],
+      str(T.dns_consistency([{"server": "a", "ok": False, "records": [],
+                               "status": "超时"}])["verdict"]))
+check("DNS：部分无应答会写清楚", _r3["failed"] == 1 and "无应答" in _r3["verdict"],
+      str(_r3["verdict"]))
+check("DNS：空输入不炸", T.dns_consistency([])["total"] == 0)
+
+# --------------------------------------------------------------------------- #
 print(f"\n{'=' * 62}")
 print(f"=== {'ALL PASS' if not FAILS else str(len(FAILS)) + ' FAILED'} ===")
 for f in FAILS:

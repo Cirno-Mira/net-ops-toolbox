@@ -10,6 +10,7 @@ SNTP 时间校准 / 本机信息汇总。全部是纯 Python + 系统命令，�
 from __future__ import annotations
 
 import getpass
+import ipaddress
 import platform
 import re
 import socket
@@ -18,6 +19,7 @@ import struct
 import subprocess
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 from .hostinfo import list_ifaces
@@ -202,6 +204,121 @@ DNS_TYPES = ["A", "AAAA", "CNAME", "MX", "NS", "TXT", "SOA", "PTR", "SRV", "CAA"
 # 系统 DNS 不通时的回退公共 DNS（国内可达性较好）
 PUBLIC_DNS = ["223.5.5.5", "119.29.29.29", "114.114.114.114", "180.76.76.76"]
 
+# 多服务器对比用的预设服务器组（顺序 = 界面下拉里的顺序）
+DNS_PRESETS: dict[str, list[str]] = {
+    "国内公共": [
+        "223.5.5.5", "223.6.6.6",              # 阿里 AliDNS
+        "119.29.29.29",                        # 腾讯 DNSPod
+        "114.114.114.114", "114.114.115.115",  # 114DNS
+        "180.76.76.76",                        # 百度 BaiduDNS
+        "180.184.1.1",                         # 字节 / 火山引擎
+    ],
+    "国际公共": [
+        "8.8.8.8", "8.8.4.4",                  # Google
+        "1.1.1.1", "1.0.0.1",                  # Cloudflare
+        "9.9.9.9",                             # Quad9
+        "208.67.222.222",                      # OpenDNS
+    ],
+    # 这几个多半查不到（家用路由器通常不对外开 DNS，或者直接拒绝），
+    # 留着是为了跟公网结果对照 —— 能答上来的那台就是内网解析器。
+    "路由器/内网": ["192.168.1.1", "192.168.0.1", "10.0.0.1"],
+    # ⚠ 这些是 DoH 服务的域名，不是 IP，直接当 nameserver 填进去必然失败；
+    # 要先过一遍 resolve_dns_hosts() 解析成 IP（界面上有「解析域名为 IP」按钮）。
+    "DoH 服务器地址": ["dns.alidns.com", "doh.pub", "dns.google",
+                       "cloudflare-dns.com", "dns.quad9.net"],
+}
+
+# 每个预设的说明，界面上直接显示给用户看
+DNS_PRESET_NOTES: dict[str, str] = {
+    "国内公共": "国内可达性好，适合当对比基线。",
+    "国际公共": "可能被污染或干脆不可达；跟国内结果不一样时，多半是分区域解析或 CDN 调度。",
+    "路由器/内网": "家用路由器多半不对外提供 DNS，查不到是正常的；能答上来的那台可用来判断内网解析是否被劫持。",
+    "DoH 服务器地址": "这些是 DoH 服务域名、不是 IP，不能直接当 DNS 服务器用，请先点「解析域名为 IP」。",
+}
+
+# IP -> 好认的名字（界面「名称」列用）
+DNS_SERVER_LABELS: dict[str, str] = {
+    "223.5.5.5": "阿里 AliDNS",
+    "223.6.6.6": "阿里 AliDNS（备用）",
+    "119.29.29.29": "腾讯 DNSPod",
+    "114.114.114.114": "114DNS",
+    "114.114.115.115": "114DNS（备用）",
+    "180.76.76.76": "百度 BaiduDNS",
+    "180.184.1.1": "字节 / 火山引擎",
+    "8.8.8.8": "Google",
+    "8.8.4.4": "Google（备用）",
+    "1.1.1.1": "Cloudflare",
+    "1.0.0.1": "Cloudflare（备用）",
+    "9.9.9.9": "Quad9",
+    "208.67.222.222": "OpenDNS",
+    "208.67.220.220": "OpenDNS（备用）",
+    "149.112.112.112": "Quad9（备用）",
+    "1.12.12.12": "腾讯 DNSPod（DoH）",
+    "120.53.53.53": "腾讯 DNSPod（DoH 备用）",
+    "2001:4860:4860::8888": "Google（IPv6）",
+    "2001:4860:4860::8844": "Google（IPv6 备用）",
+    "2606:4700:4700::1111": "Cloudflare（IPv6）",
+    "2620:fe::fe": "Quad9（IPv6）",
+    "192.168.1.1": "内网网关（常见）",
+    "192.168.0.1": "内网网关（常见）",
+    "10.0.0.1": "内网网关（常见）",
+    "127.0.0.1": "本机",
+    "::1": "本机（IPv6）",
+}
+
+# 用户手填的服务器列表里，允许出现的分隔符（中英文逗号/分号/顿号/空白）
+_DNS_SPLIT_RE = re.compile(r"[,;，、；\s]+")
+
+
+def label_for(ip: str) -> str:
+    """把 IP 换成好认的名字，查不到对应名字就原样返回 IP。"""
+    key = str(ip).strip()
+    return DNS_SERVER_LABELS.get(key, key)
+
+
+def split_dns_servers(text: str) -> list[str]:
+    """只按分隔符拆开、不去重不校验（域名也能拆），给「解析域名为 IP」用。"""
+    return [tok for tok in (t.strip() for t in _DNS_SPLIT_RE.split(str(text or "")))
+            if tok]
+
+
+def parse_dns_servers(text: str) -> list[str]:
+    """
+    解析用户手填的服务器列表（逗号/分号/空格/换行分隔），返回去重后的列表。
+
+    逐条校验是不是合法的 IPv4/IPv6 字面量：**不合法就直接抛 ValueError**，
+    绝不静默丢弃 —— 否则用户以为查了 8 台，实际只查了 7 台，对比结论会骗人。
+    顺序按用户填写的顺序保留。
+    """
+    out: list[str] = []
+    bad: list[str] = []
+    for token in split_dns_servers(text):
+        cand = token.strip().strip("[]")        # 兼容 [2400:3200::1] 这种写法
+        try:
+            ipaddress.ip_address(cand)
+        except ValueError:
+            bad.append(token)
+            continue
+        if cand not in out:
+            out.append(cand)
+    if bad:
+        shown = "、".join(bad[:6]) + ("…" if len(bad) > 6 else "")
+        raise ValueError(f"不是合法的 IP 地址：{shown}")
+    return out
+
+
+def _dns_format_records(answers, rtype: str) -> list[str]:
+    """把 dnspython 的答案对象格式化成人能读的记录字符串。"""
+    out = []
+    for a in answers:
+        if rtype.upper() == "MX":
+            out.append(f"{a.preference} {a.exchange}")
+        elif rtype.upper() == "SOA":
+            out.append(f"{a.mname} serial={a.serial} refresh={a.refresh}")
+        else:
+            out.append(str(a).strip('"'))
+    return out
+
 
 def _dns_try(name: str, rtype: str, server: str, timeout: float):
     """查一次，返回 (记录列表, 错误信息)。"""
@@ -220,14 +337,7 @@ def _dns_try(name: str, rtype: str, server: str, timeout: float):
     except Exception as exc:
         return [], f"{type(exc).__name__}: {exc}"
 
-    out = []
-    for a in answers:
-        if rtype.upper() == "MX":
-            out.append(f"{a.preference} {a.exchange}")
-        elif rtype.upper() == "SOA":
-            out.append(f"{a.mname} serial={a.serial} refresh={a.refresh}")
-        else:
-            out.append(str(a).strip('"'))
+    out = _dns_format_records(answers, rtype)
     return out, ""
 
 
@@ -253,6 +363,206 @@ def dns_query(name: str, rtype: str = "A", server: str = "",
         last_err = err or last_err
 
     return [f"（查询失败：{last_err or '所有 DNS 服务器都无响应'}）"]
+
+
+def _dns_multi_one(name: str, rtype: str, server: str, timeout: float) -> dict:
+    """
+    问一台服务器，**任何异常都收敛成返回值**，绝不往外抛。
+
+    ⚠ 必须是「一个 server 一个 Resolver 实例」：Resolver 上记着 nameservers /
+    超时 / EDNS 这些状态，多线程共用一台实例会互相串结果。
+    """
+    import dns.exception
+    import dns.resolver
+
+    r = dns.resolver.Resolver()
+    r.nameservers = [server]
+    r.timeout = timeout
+    r.lifetime = timeout
+
+    records: list[str] = []
+    error = ""
+    status = "正常"
+    ok = False
+    t0 = time.perf_counter()
+    try:
+        answers = r.resolve(name, rtype.upper())
+        records = _dns_format_records(answers, rtype)
+        ok = True
+        if not records:
+            status = "无此记录"
+    except dns.resolver.NXDOMAIN:
+        # 服务器明确回答「这域名不存在」——算有应答，只是没有记录
+        status, ok = "NXDOMAIN", True
+    except dns.resolver.NoAnswer:
+        status, ok = "无此记录", True
+    except dns.exception.Timeout:
+        status, error = "超时", f"{timeout:g}s 内没有响应"
+    except dns.resolver.NoNameservers as exc:
+        first = str(exc).strip().splitlines()
+        status = "超时" if "time" in str(exc).lower() else "无应答"
+        error = first[0] if first else type(exc).__name__
+    except Exception as exc:
+        status, error = "查询失败", f"{type(exc).__name__}: {exc}"
+    return {
+        "server": server,
+        "label": label_for(server),
+        "ok": ok,
+        "records": records,
+        "error": error,
+        "rtt_ms": (time.perf_counter() - t0) * 1000.0,
+        "status": status,
+    }
+
+
+def dns_query_multi(name: str, rtype: str = "A", servers=None,
+                    timeout: float = 5.0, workers: int = 8) -> list[dict]:
+    """
+    并发问一批 DNS 服务器同一条记录，用来对比分区域解析 / 劫持 / 死服务器。
+
+    servers=None 时用系统 DNS，读不到就退回 PUBLIC_DNS。结果按传入顺序排列，
+    每项：{"server", "label", "ok", "records", "error", "rtt_ms", "status"}。
+
+    ⚠ 线程池并发，不是一台一台串着问：死服务器只拖自己，不影响别的。
+    某一台炸了只体现在它自己的 ok/error/status 上，不会连累其它服务器。
+    """
+    if servers is None:
+        servers = dns_servers() or list(PUBLIC_DNS)
+    srv_list: list[str] = []
+    for s in servers:
+        s = str(s).strip()
+        if s and s not in srv_list:
+            srv_list.append(s)
+    if not srv_list:
+        return []
+
+    n = max(1, min(int(workers) or 1, len(srv_list)))
+    try:
+        with ThreadPoolExecutor(max_workers=n) as pool:
+            return list(pool.map(
+                lambda srv: _dns_multi_one(name, rtype, srv, timeout), srv_list))
+    except Exception as exc:
+        # 线程池本身都起不来（极端情况）：也要给调用方一份完整结果，不能抛
+        log(f"多服务器 DNS 查询失败：{type(exc).__name__}: {exc}", "error", "tools")
+        return [{"server": s, "label": label_for(s), "ok": False, "records": [],
+                 "error": f"{type(exc).__name__}: {exc}", "rtt_ms": 0.0,
+                 "status": "查询失败"} for s in srv_list]
+
+
+def dns_consistency(results: list[dict]) -> dict:
+    """
+    比较多台服务器的应答，找出谁跟谁不一样。
+
+    返回：
+        {"total", "answered", "failed", "consistent": bool,
+         "groups": [{"records": [...], "servers": [...], "count": n}],  # 台数从多到少
+         "majority_servers", "majority_records", "disagree_servers", "verdict"}
+
+    空记录（NXDOMAIN / 无此记录）按「状态」单独成一组，免得跟真的空答案混在一起。
+    ⚠ 按**集合**比较、不看顺序：A 记录轮询（round-robin）/ CDN 调度会让同一份
+    答案的返回顺序不一样，那不算「结果不同」，否则天天误报劫持。
+    """
+    answered = [r for r in results if r.get("ok")]
+    failed = [r for r in results if not r.get("ok")]
+
+    groups: list[dict] = []
+    for r in answered:
+        records = [str(x) for x in (r.get("records") or [])]
+        key = tuple(sorted(records)) if records else (str(r.get("status") or "无此记录"),)
+        for g in groups:
+            if g["key"] == key:
+                g["servers"].append(str(r.get("server", "")))
+                g["count"] += 1
+                break
+        else:
+            groups.append({"key": key, "records": records,
+                           "servers": [str(r.get("server", ""))], "count": 1})
+    groups.sort(key=lambda g: -g["count"])
+
+    total, n_ok = len(results), len(answered)
+    if not total:
+        verdict = "没有要查询的服务器"
+    elif not n_ok:
+        verdict = f"全部 {total} 台都没应答（网络或防火墙问题）"
+    elif len(groups) == 1:
+        verdict = f"{n_ok}/{total} 台一致"
+    else:
+        verdict = f"发现 {len(groups)} 种不同结果（可能存在分区域解析或劫持）"
+    if n_ok and failed:
+        verdict += f"，{len(failed)} 台无应答"
+
+    return {
+        "total": total,
+        "answered": n_ok,
+        "failed": len(failed),
+        "consistent": len(groups) == 1 and n_ok > 0 and not failed,
+        "groups": [{k: v for k, v in g.items() if k != "key"} for g in groups],
+        "majority_servers": list(groups[0]["servers"]) if groups else [],
+        "majority_records": list(groups[0]["records"]) if groups else [],
+        "disagree_servers": [s for g in groups[1:] for s in g["servers"]],
+        "verdict": verdict,
+    }
+
+
+def resolve_dns_hosts(hosts, timeout: float = 3.0,
+                      workers: int = 6) -> tuple[list[str], list[str]]:
+    """
+    把 DoH 域名解析成 IP —— DNS_PRESETS["DoH 服务器地址"] 里给的是域名，
+    必须先变成 IP 才能当 nameserver 用。已经是 IP 的原样保留。
+
+    优先取 IPv4（A）：很多网络根本没有 IPv6 出口，混进一堆 v6 地址只会
+    让对比表里一半服务器超时；只有这个域名没有 A 记录时才退回 IPv6（AAAA）。
+
+    并发解析，返回 (IP 列表, 没解析出来的名字列表)，同样不抛异常。
+    """
+    import dns.resolver
+
+    items = [str(h).strip() for h in (hosts or [])]
+    items = [h for h in items if h]
+    ips: list[str] = []
+    missing: list[str] = []
+
+    def one(host: str) -> tuple[str, list[str]]:
+        cand = host.strip().strip("[]")
+        try:
+            ipaddress.ip_address(cand)
+            return host, [cand]                 # 本来就是 IP
+        except ValueError:
+            pass
+        out: list[str] = []
+        for qtype in ("A", "AAAA"):
+            r = dns.resolver.Resolver()
+            r.timeout = timeout
+            r.lifetime = timeout
+            try:
+                for a in r.resolve(host, qtype):
+                    val = str(a).strip()
+                    if val and val not in out:
+                        out.append(val)
+            except Exception:
+                continue                        # 这种域名没有该类型记录很常见
+            if out:
+                break                           # 有 A 就不再要 AAAA 了
+        return host, out
+
+    pairs: list[tuple[str, list[str]]] = []
+    if items:
+        n = max(1, min(int(workers) or 1, len(items)))
+        try:
+            with ThreadPoolExecutor(max_workers=n) as pool:
+                pairs = list(pool.map(one, items))
+        except Exception as exc:
+            log(f"解析 DoH 域名失败：{type(exc).__name__}: {exc}", "warn", "tools")
+            pairs = [(h, []) for h in items]
+
+    for host, got in pairs:
+        if not got:
+            missing.append(host)
+            continue
+        for ip in got:
+            if ip not in ips:
+                ips.append(ip)
+    return ips, missing
 
 
 def reverse_lookup(ip: str) -> str:
