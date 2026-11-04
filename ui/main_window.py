@@ -40,11 +40,16 @@ from ui.tab_dhcp import DhcpTab
 from ui.tab_diag import DiagTab
 from ui.tab_dirbrute import DirBruteTab
 from ui.tab_fakeserv import FakeservTab
+from ui.tab_flows import FlowsTab
 from ui.tab_hash import HashTab
 from ui.tab_mitm import MitmTab
+from ui.tab_monitor import MonitorTab
+from ui.tab_passive import PassiveTab
 from ui.tab_ports import PortsTab
 from ui.tab_report import ReportTab
+from ui.tab_snmp import SnmpTab
 from ui.tab_stress import StressTab
+from ui.tab_synflood import SynFloodTab
 from ui.tab_tools import ToolsTab
 from ui.tab_tunnel import TunnelTab
 from ui.tab_vuln import VulnTab
@@ -52,11 +57,11 @@ from ui.widgets import Badge, LogBridge, LogPanel
 
 WORKFLOW_HINT = (
     "常用流程\n"
-    "① 资产发现 → 扫出设备\n"
-    "② 选中设备 → 送进 ARP 页\n"
-    "③ ARP 页开牵引（勾 DNS 引流）\n"
-    "④ 看「流量劫持」页的请求\n"
-    "⑤ 安全体检 / 抓包做深入分析\n"
+    "① 资产发现 / 被动发现 → 摸清设备\n"
+    "② SNMP → 读交换机接口与邻居\n"
+    "③ 变更监控 → 设基线看变化\n"
+    "④ 选中设备 → ARP 页开牵引\n"
+    "⑤ 流量画像 / 抓包做深入分析\n"
     "⑥ 报告导出 → 汇总成交付文档"
 )
 
@@ -101,6 +106,8 @@ class MainWindow(QMainWindow):
         self.tab_assets.send_to_ports.connect(self._to_ports)
         self.tab_assets.send_to_arp.connect(self._to_arp)
         self.tab_arp.mitm_requested.connect(self._on_mitm_requested)
+        self.tab_passive.send_to_ports.connect(self._to_ports)
+        self.tab_monitor.passive_provider = lambda: self.tab_passive.collector
 
         # 退出时无论如何都要把 ARP 表恢复
         atexit.register(M.emergency_restore_all)
@@ -112,7 +119,9 @@ class MainWindow(QMainWindow):
         for page in (self.tab_arp, self.tab_mitm, self.tab_capture,
                      self.tab_tunnel, self.tab_fakeserv, self.tab_vuln,
                      self.tab_dirbrute, self.tab_hash, self.tab_assets,
-                     self.tab_ports, self.tab_stress, self.tab_dhcp):
+                     self.tab_ports, self.tab_stress, self.tab_dhcp,
+                     self.tab_passive, self.tab_snmp, self.tab_monitor,
+                     self.tab_flows, self.tab_synflood):
             page.note_action = self.note_action
         self.show_page(self.tab_assets)
         log("网络运维工具箱已启动", "success", "app")
@@ -140,7 +149,7 @@ class MainWindow(QMainWindow):
         head.addWidget(title)
         head.addWidget(Badge(f"v{APP_VERSION}", "idle"))
         head.addStretch(1)
-        sub = QLabel("资产发现 · 端口扫描 · ARP 牵引/断网 · 流量劫持改包 · 压力测试 · 抓包重放 · 运维工具")
+        sub = QLabel("资产发现 · 被动审计 · SNMP · 变更监控 · ARP 牵引 · 流量画像 · 压力测试 · 抓包重放 · 运维工具")
         sub.setObjectName("Sub")
         col.addLayout(head)
         col.addWidget(sub)
@@ -189,6 +198,11 @@ class MainWindow(QMainWindow):
         self.tab_hash = HashTab()
         self.tab_stress = StressTab()
         self.tab_dhcp = DhcpTab()
+        self.tab_passive = PassiveTab()
+        self.tab_snmp = SnmpTab()
+        self.tab_monitor = MonitorTab()
+        self.tab_flows = FlowsTab()
+        self.tab_synflood = SynFloodTab()
 
         self.stack = QStackedWidget()
 
@@ -210,6 +224,14 @@ class MainWindow(QMainWindow):
                 ("📂 目录爆破", self.tab_dirbrute,
                  "常见路径 / 接口爆破，自动过滤软 404"),
             ]),
+            ("🛰 资产与设备", [
+                ("🛰 被动发现", self.tab_passive,
+                 "旁路监听 ARP / DHCP / mDNS / LLDP，做 IP-MAC 审计与拓扑还原"),
+                ("🛰 SNMP 设备信息", self.tab_snmp,
+                 "v1/v2c 读取型号、接口表、ARP 表、LLDP 邻居（只读为主）"),
+                ("📈 变更监控", self.tab_monitor,
+                 "定期采样并存快照，对比出新设备 / 消失设备 / 字段变化"),
+            ]),
             ("⚡ 攻击与劫持", [
                 ("⚡ ARP 牵引 / 断网", self.tab_arp,
                  "双向中间人 / 单向抓包 / 断网攻击（arp death），含 DNS 引流"),
@@ -225,6 +247,8 @@ class MainWindow(QMainWindow):
             ("🔥 压力测试", [
                 ("🌊 连接数与流量压力", self.tab_stress,
                  "并发 TCP 连接数测试 + TCP/UDP/ICMP/HTTP 压力 + Slowloris 慢速连接"),
+                ("💥 SYN Flood", self.tab_synflood,
+                 "发半开 SYN 验证目标 SYN backlog；需授权，建议先低速率短时长"),
             ]),
             ("🛡 检测与报告", [
                 ("🛡 安全体检", self.tab_vuln,
@@ -235,6 +259,8 @@ class MainWindow(QMainWindow):
             ("📡 分析与诊断", [
                 ("📡 抓包分析", self.tab_capture,
                  "实时抓包、TCP 会话重组、流量统计、选中包编辑重放"),
+                ("🏆 流量画像", self.tab_flows,
+                 "五元组流表 + Top Talkers + 应用识别 + pcap 离线分析"),
                 ("🩺 环境自检", self.tab_diag,
                  "权限 / 网卡 / 端口 / 防火墙体检，以及无害的发包自检"),
             ]),
@@ -408,7 +434,12 @@ class MainWindow(QMainWindow):
                          ("穿透隧道", getattr(self.tab_tunnel, "shutdown", None)),
                          ("假服务", getattr(self.tab_fakeserv, "shutdown", None)),
                          ("压力测试", getattr(self.tab_stress, "shutdown", None)),
-                         ("DHCP 测试", getattr(self.tab_dhcp, "shutdown", None))):
+                         ("DHCP 测试", getattr(self.tab_dhcp, "shutdown", None)),
+                         ("变更监控", getattr(self.tab_monitor, "shutdown", None)),
+                         ("被动发现", getattr(self.tab_passive, "shutdown", None)),
+                         ("SNMP 查询", getattr(self.tab_snmp, "shutdown", None)),
+                         ("流量画像", getattr(self.tab_flows, "shutdown", None)),
+                         ("SYN Flood", getattr(self.tab_synflood, "shutdown", None))):
             if fn is None:
                 continue
             try:
@@ -420,7 +451,9 @@ class MainWindow(QMainWindow):
         pages = [self.tab_assets, self.tab_ports, self.tab_vuln,
                  self.tab_dirbrute, self.tab_hash, self.tab_tools,
                  self.tab_arp, self.tab_mitm, self.tab_capture,
-                 self.tab_tunnel, self.tab_fakeserv, self.tab_stress]
+                 self.tab_tunnel, self.tab_fakeserv, self.tab_stress,
+                 self.tab_passive, self.tab_snmp, self.tab_monitor,
+                 self.tab_flows, self.tab_synflood]
         for page in pages:
             for meth in ("stop_scan", "stop_all", "stop", "stop_worker"):
                 fn = getattr(page, meth, None)

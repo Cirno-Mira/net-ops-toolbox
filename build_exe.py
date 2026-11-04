@@ -37,6 +37,8 @@ HIDDEN = [
     "scapy.layers.inet",
     "scapy.layers.inet6",
     "scapy.layers.dns",
+    "scapy.contrib.lldp",
+    "scapy.contrib.cdp",
     "scapy.arch.windows",
     "dns.resolver",
     "dns.rdatatype",

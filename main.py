@@ -7,9 +7,14 @@
 
   🎯 资产发现      ARP / Ping 扫描，识别 IP、MAC、厂商、主机名、开放端口
   🔎 端口扫描      TCP connect 扫描 + Banner 抓取
+  🛰 被动发现      旁路监听 ARP / DHCP / mDNS / NBNS / LLDP / CDP，做 IP-MAC 审计
+  🛰 SNMP 设备     自写 BER 的 v1/v2c 客户端：型号、接口、ARP、LLDP 邻居
+  📈 变更监控      定期采样并存快照，对比新增 / 消失 / 字段变化
+  🏆 流量画像      五元组流表、Top Talkers、应用识别、pcap 离线分析
   ⚡ ARP 流量牵引   双向中间人 / 单向断网；DNS 引流；停止自动恢复
   🕵 流量劫持      内建 HTTP/HTTPS 透明代理：看请求、改包、重放、断点
   📡 抓包分析      scapy 实时抓包，可落盘 pcap、可编辑重放
+  💥 SYN Flood     发半开 SYN 验证目标 SYN backlog（需显式授权）
   🧰 运维工具      本机信息 / Ping / 路由追踪 / DNS / WOL / HTTP / 子网 / 时间
 
 运行

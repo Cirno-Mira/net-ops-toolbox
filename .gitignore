@@ -18,6 +18,9 @@ crash.log
 certs/
 *.pcap
 *.pcapng
+netops_history.db
+netops_history.db-wal
+netops_history.db-shm
 
 # 编辑器
 .vscode/

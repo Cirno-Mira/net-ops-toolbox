@@ -812,6 +812,556 @@ check("DNS：部分无应答会写清楚", _r3["failed"] == 1 and "无应答" in
 check("DNS：空输入不炸", T.dns_consistency([])["total"] == 0)
 
 # --------------------------------------------------------------------------- #
+section("16. 被动发现：包解析 / 告警 / 审计")
+
+import tempfile as _tempfile     # noqa: E402
+import shutil as _shutil2        # noqa: E402
+from core import passive as PV   # noqa: E402
+from scapy.all import BOOTP, DHCP  # noqa: E402
+
+_pv = PV.PassiveCollector(local_iface="selftest0")
+_pv.observe(Ether(src="02:00:00:00:00:01")
+            / ARP(op=2, psrc="10.0.9.20", hwsrc="02:00:00:00:00:01",
+                  pdst="10.0.9.1"))
+check("被动发现：ARP 应答记进资产表", "10.0.9.20" in _pv.hosts,
+      str(list(_pv.hosts)))
+check("被动发现：ARP 的 MAC 正确",
+      _pv.hosts["10.0.9.20"].mac == "02:00:00:00:00:01",
+      _pv.hosts["10.0.9.20"].mac)
+check("被动发现：记录了来源",
+      "ARP 应答" in _pv.hosts["10.0.9.20"].sources,
+      str(_pv.hosts["10.0.9.20"].sources))
+
+# 同一 IP 换 MAC → IP 冲突告警
+_pv.observe(Ether(src="02:00:00:00:00:02")
+            / ARP(op=2, psrc="10.0.9.20", hwsrc="02:00:00:00:00:02",
+                  pdst="10.0.9.1"))
+check("被动发现：同一 IP 出现两个 MAC 会告警",
+      any(a.kind == "ip_conflict" for a in _pv.alerts),
+      str([(a.kind, a.ip) for a in _pv.alerts]))
+check("被动发现：旧 MAC 保留在历史里",
+      "02:00:00:00:00:02" in _pv.hosts["10.0.9.20"].mac_history,
+      str(_pv.hosts["10.0.9.20"].mac_history))
+
+# ARP 扫描：10 秒内问 20+ 个不同地址
+for _i in range(24):
+    _pv.observe(Ether(src="02:00:00:00:00:03")
+                / ARP(op=1, psrc="10.0.9.50", hwsrc="02:00:00:00:00:03",
+                      pdst=f"10.0.9.{100 + _i}"), ts=1000.0 + _i * 0.1)
+check("被动发现：短时间扫多个地址会告警 ARP 扫描",
+      any(a.kind == "arp_scan" for a in _pv.alerts),
+      str([(a.kind, a.severity) for a in _pv.alerts]))
+
+# DHCP：流氓服务器 + 客户端信息
+_dhcp_ack = (Ether(src="02:00:00:00:00:66", dst="ff:ff:ff:ff:ff:ff")
+             / IP(src="10.0.9.66", dst="255.255.255.255")
+             / UDP(sport=67, dport=68)
+             / BOOTP(chaddr=b"\x02\x00\x00\xaa\xbb\xcc", xid=7,
+                     yiaddr="10.0.9.77", siaddr="10.0.9.66")
+             / DHCP(options=[("message-type", "ack"),
+                             ("hostname", "selftest-pc"),
+                             ("vendor_class_id", "MSFT 5.0"), "end"]))
+_pv.trusted_dhcp = {"10.0.9.1"}
+_pv.observe(_dhcp_ack)
+check("被动发现：DHCP ACK 落进资产表", "10.0.9.77" in _pv.hosts,
+      str(list(_pv.hosts)))
+check("被动发现：DHCP 主机名被采用",
+      _pv.hosts["10.0.9.77"].hostname == "selftest-pc",
+      _pv.hosts["10.0.9.77"].hostname)
+check("被动发现：DHCP 厂商类被采用",
+      _pv.hosts["10.0.9.77"].dhcp_vendor == "MSFT 5.0",
+      _pv.hosts["10.0.9.77"].dhcp_vendor)
+check("被动发现：非受信任 DHCP 服务器告警",
+      any(a.kind == "rogue_dhcp" and a.ip == "10.0.9.66"
+          for a in _pv.alerts),
+      str([(a.kind, a.ip) for a in _pv.alerts]))
+
+# 受信任服务器不应误报
+_before = sum(1 for a in _pv.alerts if a.kind == "rogue_dhcp")
+_trusted = (Ether(src="02:00:00:00:00:11", dst="ff:ff:ff:ff:ff:ff")
+            / IP(src="10.0.9.1", dst="255.255.255.255")
+            / UDP(sport=67, dport=68)
+            / BOOTP(chaddr=b"\x02\x00\x00\xaa\xbb\xcd", xid=8,
+                    yiaddr="10.0.9.78", siaddr="10.0.9.1")
+            / DHCP(options=[("message-type", "offer"), "end"]))
+_pv.observe(_trusted)
+check("被动发现：受信任 DHCP 服务器不误报",
+      sum(1 for a in _pv.alerts if a.kind == "rogue_dhcp") == _before,
+      str([(a.kind, a.ip) for a in _pv.alerts]))
+
+# mDNS / NBNS 补主机名
+_mdns_pkt = (Ether(src="02:00:00:00:00:01")
+             / IP(src="10.0.9.20", dst="224.0.0.251")
+             / UDP(sport=5353, dport=5353)
+             / DNS(qd=DNSQR(qname="cam-1.local")))
+_pv.observe(_mdns_pkt)
+check("被动发现：mDNS 补上主机名",
+      _pv.hosts["10.0.9.20"].hostname == "cam-1",
+      _pv.hosts["10.0.9.20"].hostname)
+
+_nbns_pkt = (Ether(src="02:00:00:00:00:04")
+             / IP(src="10.0.9.21", dst="10.0.9.255")
+             / UDP(sport=137, dport=137)
+             / DNS(qd=DNSQR(qname=b"PC1<20>")))
+_pv.observe(_nbns_pkt)
+check("被动发现：NBNS 去掉 <20> 后缀后补主机名",
+      _pv.hosts.get("10.0.9.21") is not None
+      and _pv.hosts["10.0.9.21"].hostname == "PC1",
+      str(_pv.hosts.get("10.0.9.21").hostname
+          if _pv.hosts.get("10.0.9.21") else None))
+
+# LLDP / CDP 邻居
+from scapy.contrib.lldp import (LLDPDU, LLDPDUEndOfLLDPDU,  # noqa: E402
+                                 LLDPDUPortID, LLDPDUSystemDescription,
+                                 LLDPDUSystemName)
+from scapy.contrib.cdp import (CDPMsgDeviceID, CDPMsgPlatform,  # noqa: E402
+                                CDPMsgPortID, CDPv2_HDR)
+from scapy.all import LLC, SNAP                              # noqa: E402
+
+_lldp_pkt = (Ether(dst="01:80:c2:00:00:0e", src="02:00:00:00:00:05",
+                   type=0x88CC)
+             / LLDPDU() / LLDPDUSystemName(system_name="sw-core")
+             / LLDPDUPortID(subtype=5, id=b"Gi0/1")
+             / LLDPDUSystemDescription(description="Cisco IOS")
+             / LLDPDUEndOfLLDPDU())
+_pv.observe(_lldp_pkt)
+check("被动发现：LLDP 邻居被解析",
+      any(ln.source == "LLDP" and ln.remote == "sw-core"
+          for ln in _pv.links.values()),
+      str([(ln.source, ln.remote, ln.remote_port)
+           for ln in _pv.links.values()]))
+check("被动发现：LLDP 端口与平台正确",
+      any(ln.source == "LLDP" and ln.remote_port == "Gi0/1"
+          and ln.platform == "Cisco IOS" for ln in _pv.links.values()),
+      str([(ln.remote_port, ln.platform) for ln in _pv.links.values()]))
+
+_cdp_pkt = (Ether(dst="01:00:0c:cc:cc:cc", src="02:00:00:00:00:06")
+            / LLC() / SNAP() / CDPv2_HDR()
+            / CDPMsgDeviceID(val="sw-edge")
+            / CDPMsgPortID(iface="Fa0/2")
+            / CDPMsgPlatform(val="cisco WS-C2960"))
+_pv.observe(_cdp_pkt)
+check("被动发现：CDP 邻居被解析",
+      any(ln.source == "CDP" and ln.remote == "sw-edge"
+          for ln in _pv.links.values()),
+      str([(ln.source, ln.remote) for ln in _pv.links.values()]))
+
+# 快照 / 审计 / BPF / 导出
+_snap = _pv.snapshot()
+check("被动发现：snapshot 带事件流",
+      len(_snap["events"]) >= 5 and bool(_snap["events"][0].get("time")),
+      str(len(_snap["events"])))
+check("被动发现：snapshot 的计数与资产数一致",
+      _snap["host_count"] == len(_snap["hosts"]) and _snap["host_count"] > 0,
+      f"{_snap['host_count']} / {len(_snap['hosts'])}")
+
+_gw = PV.PassiveCollector(local_iface="selftest0", gateway_ip="10.0.9.1",
+                          gateway_mac="02:00:00:00:00:99")
+_gw.observe(Ether(src="02:00:00:00:00:07")
+            / ARP(op=2, psrc="10.0.9.1", hwsrc="02:00:00:00:00:07",
+                  pdst="10.0.9.20"))
+check("被动发现：网关 MAC 不符会进审计结论",
+      any("网关" in f["title"] for f in _gw.audit()),
+      str([f["title"] for f in _gw.audit()]))
+check("被动发现：audit 也接受 snapshot 的 dict",
+      isinstance(PV.audit(_snap["hosts"], _snap["alerts"]), list))
+
+check("被动发现：BPF 只勾 ARP 时就是 'arp'",
+      PV.bpf_for({"arp": True, "dhcp": False, "mdns": False,
+                  "nbns": False, "lldp": False, "cdp": False}) == "arp")
+_full_bpf = PV.bpf_for({})
+check("被动发现：默认 BPF 覆盖 LLDP/CDP",
+      "0x88cc" in _full_bpf and "01:00:0c:cc:cc:cc" in _full_bpf,
+      _full_bpf)
+
+_tmp_pv = _tempfile.mkdtemp(prefix="netops-pv-")
+_csv_path = os.path.join(_tmp_pv, "passive.csv")
+try:
+    _n_csv = PV.export_csv(_csv_path, _snap["hosts"])
+    with open(_csv_path, encoding="utf-8") as _fh:
+        _csv_head = _fh.readline()
+    check("被动发现：CSV 导出条数与资产数一致",
+          _n_csv == _snap["host_count"], f"{_n_csv} / {_snap['host_count']}")
+    check("被动发现：CSV 带 BOM 与表头",
+          _csv_head.startswith("\ufeff") and "IP" in _csv_head,
+          _csv_head[:30])
+finally:
+    _shutil2.rmtree(_tmp_pv, ignore_errors=True)
+
+# --------------------------------------------------------------------------- #
+section("17. SNMP：BER 编解码与报文解析")
+
+from core import snmp as SNMP   # noqa: E402
+
+for _oid in ("1.3.6.1.2.1.1.1.0", "1.0", "2.999.3", "1.3.6.1.4.1.9.1.1208"):
+    _raw = SNMP.encode_oid(_oid)
+    check(f"SNMP：OID 往返 {_oid}", SNMP.decode_oid(_raw) == _oid,
+          SNMP.decode_oid(_raw))
+try:
+    SNMP.encode_oid("5.1.1")
+    _oid_bad = False
+except SNMP.BERError:
+    _oid_bad = True
+check("SNMP：OID 首段非法会报错", _oid_bad)
+try:
+    SNMP.encode_oid("1")
+    _oid_short = False
+except SNMP.BERError:
+    _oid_short = True
+check("SNMP：不足两段的 OID 会报错", _oid_short)
+
+_req = SNMP.build_get(["1.3.6.1.2.1.1.1.0"], "public", 2, request_id=99)
+_req_tag, _req_body, _ = SNMP.read_tlv(_req, 0)
+_req_parts = SNMP._children(_req_body)
+check("SNMP：GET 报文是 SEQUENCE", _req_tag == SNMP.TAG_SEQUENCE)
+check("SNMP：v2c 的 version 字段是 1",
+      int.from_bytes(_req_parts[0][1], "big", signed=True) == 1)
+check("SNMP：团体名原样编码", _req_parts[1][1] == b"public")
+check("SNMP：PDU 是 GetRequest", _req_parts[2][0] == SNMP.PDU_GET)
+check("SNMP：request-id 是 99",
+      int.from_bytes(SNMP._children(_req_parts[2][1])[0][1],
+                     "big", signed=True) == 99)
+check("SNMP：v1 的 version 字段是 0",
+      int.from_bytes(SNMP._children(
+          SNMP.read_tlv(SNMP.build_get(["1.0"], "public", 1), 0)[1]
+      )[0][1], "big", signed=True) == 0)
+check("SNMP：GETBULK 的 PDU tag 是 0xA5",
+      SNMP._children(SNMP.read_tlv(SNMP.build_getbulk(["1.3.6"], "public"),
+                                   0)[1])[2][0] == SNMP.PDU_GETBULK)
+
+
+def _snmp_vb(oid, payload):
+    return SNMP.tlv(SNMP.TAG_SEQUENCE,
+                    SNMP.tlv(SNMP.TAG_OID, SNMP.encode_oid(oid)) + payload)
+
+
+def _snmp_response(rid=4242, err=0, err_index=0, varbinds=None):
+    pdu = SNMP.tlv(
+        SNMP.PDU_RESPONSE,
+        SNMP.encode_int(rid) + SNMP.encode_int(err)
+        + SNMP.encode_int(err_index)
+        + SNMP.tlv(SNMP.TAG_SEQUENCE, b"".join(varbinds or [])))
+    return SNMP.build_message(pdu, "public", 2)
+
+
+_resp = SNMP.parse_message(_snmp_response(varbinds=[
+    _snmp_vb(SNMP.OID_SYS_DESCR, SNMP.encode_octets("Cisco IOS Software")),
+    _snmp_vb(SNMP.OID_SYS_UPTIME,
+             SNMP.tlv(SNMP.TAG_TIMETICKS, (12345).to_bytes(3, "big"))),
+    _snmp_vb("1.3.6.1.2.1.4.20.1.1.1",
+             SNMP.tlv(SNMP.TAG_IPADDRESS, bytes([192, 168, 1, 1]))),
+    _snmp_vb(SNMP.OID_SYS_OBJECT_ID,
+             SNMP.tlv(SNMP.TAG_OID, SNMP.encode_oid("1.3.6.1.4.1.9"))),
+]))
+check("SNMP：响应报文解析成功且无错误", _resp.ok and _resp.error_status == 0,
+      _resp.error_text)
+check("SNMP：request-id 对得上", _resp.request_id == 4242)
+check("SNMP：varbind 数量正确", len(_resp.varbinds) == 4,
+      str(len(_resp.varbinds)))
+check("SNMP：OctetString 解成文本",
+      _resp.varbinds[0].value == "Cisco IOS Software",
+      repr(_resp.varbinds[0].value))
+check("SNMP：TimeTicks 换成可读时长",
+      _resp.varbinds[1].display() == "00:02:03",
+      _resp.varbinds[1].display())
+check("SNMP：IpAddress 解成点分十进制",
+      _resp.varbinds[2].value == "192.168.1.1",
+      repr(_resp.varbinds[2].value))
+check("SNMP：OID 类型的值能还原",
+      _resp.varbinds[3].value == "1.3.6.1.4.1.9",
+      repr(_resp.varbinds[3].value))
+check("SNMP：to_dict 带中文名",
+      _resp.varbinds[0].to_dict()["name"] == "系统描述",
+      str(_resp.varbinds[0].to_dict()))
+
+_err_resp = SNMP.parse_message(_snmp_response(err=2, err_index=1))
+check("SNMP：错误状态被识别", (not _err_resp.ok)
+      and _err_resp.error_text == "noSuchName", _err_resp.error_text)
+try:
+    SNMP.parse_message(b"\x30\x03\x02\x01")
+    _ber_bad = False
+except SNMP.BERError:
+    _ber_bad = True
+check("SNMP：截断报文抛 BERError", _ber_bad)
+
+check("SNMP：format_ticks", SNMP.format_ticks(12345) == "00:02:03",
+      SNMP.format_ticks(12345))
+check("SNMP：format_speed 1Gbps",
+      SNMP.format_speed(1_000_000_000) == "1 Gbps",
+      SNMP.format_speed(1_000_000_000))
+check("SNMP：厂商推断 Cisco",
+      SNMP.guess_vendor("Cisco IOS Software", "") == "Cisco")
+check("SNMP：厂商推断 Huawei",
+      SNMP.guess_vendor("Huawei VRP", "") == "Huawei")
+check("SNMP：OID 中文名", SNMP.oid_name(SNMP.OID_SYS_NAME) == "设备名")
+check("SNMP：默认团体名会被标高风险",
+      any(f["severity"] == "high"
+          for f in SNMP.security_report({"sysDescr": "x"}, "public")))
+check("SNMP：自定义团体名不误报默认值",
+      not any(f["title"] == "使用常见默认团体名"
+              for f in SNMP.security_report({"sysDescr": "x"}, "my-community")))
+
+try:
+    SNMP.build_set("public", [(SNMP.OID_SYS_NAME, "ip", "999.1.1.1")])
+    _set_bad = False
+except SNMP.BERError:
+    _set_bad = True
+check("SNMP：SET 里非法 IPv4 会被拒绝", _set_bad)
+
+# --------------------------------------------------------------------------- #
+section("18. 快照仓库与差异对比（临时 SQLite）")
+
+from core import store as STORE   # noqa: E402
+
+_tmp_db_dir = _tempfile.mkdtemp(prefix="netops-db-")
+_tmp_db = os.path.join(_tmp_db_dir, "history.db")
+_store = STORE.SnapshotStore(_tmp_db)
+_rows_a = [
+    {"ip": "1.1.1.1", "mac": "aa:aa:aa:aa:aa:01", "hostname": "a",
+     "ports": [80]},
+    {"ip": "1.1.1.2", "mac": "aa:aa:aa:aa:aa:02", "hostname": "b",
+     "ports": []},
+    {"ip": "1.1.1.3", "mac": "aa:aa:aa:aa:aa:03", "hostname": "c",
+     "ports": [22]},
+]
+_rows_b = [
+    {"ip": "1.1.1.1", "mac": "aa:aa:aa:aa:aa:01", "hostname": "a2",
+     "ports": [80, 443]},
+    {"ip": "1.1.1.3", "mac": "aa:aa:aa:aa:aa:03", "hostname": "c",
+     "ports": [22]},
+    {"ip": "1.1.1.4", "mac": "aa:aa:aa:aa:aa:04", "hostname": "d",
+     "ports": []},
+]
+_id1 = _store.save("assets", _rows_a, "第一份", {"source": "selftest"})
+_id2 = _store.save("assets", _rows_b, "第二份")
+check("快照：两次保存拿到递增 ID", _id2 > _id1, f"{_id1} / {_id2}")
+check("快照：列表里有两份",
+      len(_store.list("assets")) == 2, str(len(_store.list("assets"))))
+check("快照：可以按 ID 读回来",
+      _store.load(_id1) is not None
+      and _store.load(_id1).row_count == 3)
+check("快照：latest 返回最新一份", _store.latest("assets").id == _id2)
+check("快照：previous 返回上一份", _store.previous("assets", _id2).id == _id1)
+check("快照：kinds 统计正确",
+      _store.kinds()[0]["total"] == 2, str(_store.kinds()))
+
+_diff = STORE.diff_rows(_rows_a, _rows_b, key_field="ip",
+                        ignore_fields=("last_seen",))
+check("差异：新增 1 条", [r["ip"] for r in _diff.added] == ["1.1.1.4"],
+      str([r["ip"] for r in _diff.added]))
+check("差异：消失 1 条", [r["ip"] for r in _diff.removed] == ["1.1.1.2"],
+      str([r["ip"] for r in _diff.removed]))
+check("差异：字段级变化被发现",
+      ("1.1.1.1", "hostname") in [(c["key"], c["field"])
+                                   for c in _diff.changed],
+      str([(c["key"], c["field"]) for c in _diff.changed]))
+check("差异：列表字段变化也能比较",
+      any(c["key"] == "1.1.1.1" and c["field"] == "ports"
+          for c in _diff.changed),
+      str([(c["key"], c["field"]) for c in _diff.changed]))
+check("差异：未变 1 条", _diff.unchanged == 1, str(_diff.unchanged))
+check("差异：summary / counts 一致",
+      _diff.counts() == {"added": 1, "removed": 1, "changed": 2,
+                         "unchanged": 1},
+      str(_diff.counts()))
+check("差异：rows() 能生成表格行",
+      len(_diff.rows()) == 4 and _diff.rows()[0][0] in ("新增", "消失", "变化"),
+      str(_diff.rows()[:1]))
+
+_json_path = os.path.join(_tmp_db_dir, "snapshots.json")
+try:
+    _n_export = _store.export_json(_json_path)
+    check("快照：导出 JSON 含两份",
+          _n_export == 2 and os.path.getsize(_json_path) > 0,
+          str(_n_export))
+    with open(_json_path, encoding="utf-8") as _fh:
+        import json as _json      # noqa: E402
+        _data = _json.load(_fh)
+    check("快照：导出的 JSON 结构正确",
+          _data[0]["kind"] == "assets" and "rows" in _data[0], str(_data[0])[:80])
+finally:
+    _store.close()
+
+_store2 = STORE.SnapshotStore(_tmp_db)
+_removed = _store2.prune("assets", keep=1)
+check("快照：prune 只留 1 份",
+      _removed == 1 and len(_store2.list("assets")) == 1,
+      f"删除 {_removed}，剩 {len(_store2.list('assets'))}")
+_store2.close()
+_shutil2.rmtree(_tmp_db_dir, ignore_errors=True)
+
+check("快照：rows_from_passive 去掉易变字段",
+      "packets" not in STORE.rows_from_passive(
+          [{"ip": "1.1.1.1", "packets": 3, "last_seen": "x"}])[0])
+
+# --------------------------------------------------------------------------- #
+section("19. 流量画像：应用识别 / 流表 / pcap 离线分析")
+
+from core import flows as FL      # noqa: E402
+from scapy.all import Raw, DNSRR, wrpcap  # noqa: E402
+
+
+def _tls_hello(host):
+    name = host.encode("ascii")
+    ext = (b"\x00\x00" + (len(name) + 5).to_bytes(2, "big")
+           + (len(name) + 3).to_bytes(2, "big") + b"\x00"
+           + len(name).to_bytes(2, "big") + name)
+    body = (b"\x03\x03" + b"\x11" * 32 + b"\x00" + b"\x00\x02\x00\x2f"
+            + b"\x01\x00" + len(ext).to_bytes(2, "big") + ext)
+    handshake = b"\x01" + len(body).to_bytes(3, "big") + body
+    return b"\x16\x03\x01" + len(handshake).to_bytes(2, "big") + handshake
+
+
+_hello = _tls_hello("example.org")
+check("流量画像：TLS ClientHello 能取出 SNI",
+      FL.tls_sni(_hello) == "example.org", repr(FL.tls_sni(_hello)))
+check("流量画像：非 TLS 载荷不误判", FL.tls_sni(b"GET / HTTP/1.1\r\n") == "")
+check("流量画像：HTTP Host 解析",
+      FL.http_host(b"GET /x HTTP/1.1\r\nHost: test.local\r\n\r\n")
+      == "test.local")
+check("流量画像：HTTP 方法解析",
+      FL.http_method(b"POST / HTTP/1.1\r\n") == "POST")
+check("流量画像：端口识别 HTTPS",
+      FL.app_by_ports("TCP", 443, 50000) == "HTTPS")
+check("流量画像：端口识别 DNS",
+      FL.app_by_ports("UDP", 53, 50000) == "DNS")
+check("流量画像：载荷识别 SSH",
+      FL.app_by_payload("TCP", b"SSH-2.0-OpenSSH") == "SSH")
+check("流量画像：载荷识别 TLS",
+      FL.app_by_payload("TCP", _hello) == "TLS")
+
+_ft = FL.FlowTable(local_nets=["192.168.1.0/24"])
+_p_hello = (Ether() / IP(src="192.168.1.10", dst="93.184.216.34")
+            / TCP(sport=51000, dport=443, flags="PA") / Raw(_hello))
+_p_reply = (Ether() / IP(src="93.184.216.34", dst="192.168.1.10")
+            / TCP(sport=443, dport=51000, flags="A") / Raw(b"ok"))
+_p_dns = (Ether() / IP(src="192.168.1.10", dst="1.1.1.1")
+          / UDP(sport=53000, dport=53)
+          / DNS(an=DNSRR(rrname="example.org", rdata="93.184.216.34")))
+for _pkt in (_p_hello, _p_reply, _p_dns):
+    _ft.add(_pkt)
+_fsnap = _ft.snapshot()
+check("流量画像：三条流被聚合", _fsnap["flows_total"] == 3,
+      str(_fsnap["flows_total"]))
+check("流量画像：TLS 流识别出 SNI",
+      any(f["sni"] == "example.org" for f in _fsnap["flows"]),
+      str([f["sni"] for f in _fsnap["flows"]]))
+check("流量画像：Top Talkers 有本机",
+      _fsnap["talkers"][0]["host"] == "192.168.1.10",
+      str(_fsnap["talkers"][:1]))
+check("流量画像：应用分布包含 HTTPS",
+      any(a["app"] == "HTTPS" for a in _fsnap["apps"]),
+      str([a["app"] for a in _fsnap["apps"]]))
+check("流量画像：top_destinations 有字节数",
+      bool(_ft.top_destinations(3))
+      and _ft.top_destinations(3)[0][1] > 0,
+      str(_ft.top_destinations(3)))
+check("流量画像：flow_rows 是对外表格行",
+      len(_ft.flow_rows(2)) == 2 and len(_ft.flow_rows(2)[0]) == 9,
+      str(len(_ft.flow_rows(2)[0])) if _ft.flow_rows(2) else "0")
+
+_ft.reset()
+check("流量画像：reset 清空统计",
+      _ft.packets == 0 and not _ft.flows and _ft.snapshot()["flows_total"] == 0)
+
+_tmp_fl = _tempfile.mkdtemp(prefix="netops-fl-")
+_pcap_path = os.path.join(_tmp_fl, "sample.pcap")
+try:
+    wrpcap(_pcap_path, [_p_hello, _p_reply, _p_dns])
+    _offline = FL.analyze_pcap(_pcap_path)
+    check("流量画像：pcap 离线分析读回 3 个包",
+          _offline.packets == 3, str(_offline.packets))
+    check("流量画像：离线分析也能识别 SNI",
+          any(f.sni == "example.org" for f in _offline.flows.values()),
+          str([f.sni for f in _offline.flows.values()]))
+finally:
+    _shutil2.rmtree(_tmp_fl, ignore_errors=True)
+
+check("流量画像：format_bytes", FL.format_bytes(1536) == "1.5 KB",
+      FL.format_bytes(1536))
+check("流量画像：format_rate", FL.format_rate(125000) == "1.0 Mbps",
+      FL.format_rate(125000))
+check("流量画像：format_duration", FL.format_duration(65) == "1 分 05 秒",
+      FL.format_duration(65))
+
+# --------------------------------------------------------------------------- #
+section("20. SYN Flood：目标校验 / 组包 / 演练模式")
+
+import types as _types           # noqa: E402
+from core import synflood as SY  # noqa: E402
+
+check("SYN：私有地址允许", SY.validate_target("192.168.1.10", 80)[0])
+check("SYN：公网默认拒绝", SY.validate_target("8.8.8.8", 80, False)[0] is False)
+check("SYN：公网显式授权后允许",
+      SY.validate_target("8.8.8.8", 80, True)[0])
+check("SYN：回环地址拒绝", SY.validate_target("127.0.0.1", 80)[0] is False)
+check("SYN：组播地址拒绝", SY.validate_target("224.0.0.1", 80)[0] is False)
+check("SYN：广播地址拒绝", SY.validate_target("192.168.1.255", 80)[0] is False)
+check("SYN：非法 IP 拒绝", SY.validate_target("not-an-ip", 80)[0] is False)
+check("SYN：非法端口拒绝", SY.validate_target("192.168.1.10", 0)[0] is False)
+
+_fake_iface = _types.SimpleNamespace(
+    ip="192.168.1.10", mac="aa:bb:cc:dd:ee:ff", l2_name="",
+    gateway="192.168.1.1", alias="selftest", cidr="192.168.1.0/24")
+_syn_pkt = SY.build_syn_packet(
+    "192.168.1.20", 80, "192.168.1.10", 40000,
+    "aa:bb:cc:dd:ee:ff", "11:22:33:44:55:66", seq=7)
+check("SYN：组出来的包带 Ether 源 MAC",
+      str(_syn_pkt["Ether"].src).lower() == "aa:bb:cc:dd:ee:ff",
+      str(_syn_pkt["Ether"].src))
+check("SYN：TCP 标志是 SYN",
+      int(_syn_pkt["TCP"].flags) == 0x02, str(_syn_pkt["TCP"].flags))
+check("SYN：目标地址与端口正确",
+      (_syn_pkt["IP"].dst, int(_syn_pkt["TCP"].dport))
+      == ("192.168.1.20", 80),
+      f"{_syn_pkt['IP'].dst}:{_syn_pkt['TCP'].dport}")
+check("SYN：序号被写入", int(_syn_pkt["TCP"].seq) == 7,
+      str(_syn_pkt["TCP"].seq))
+try:
+    SY.build_syn_packet("192.168.1.20", 80, "192.168.1.10", 40000, "",
+                        "11:22:33:44:55:66")
+    _no_src = False
+except ValueError:
+    _no_src = True
+check("SYN：缺少源 MAC 会被拒绝", _no_src)
+try:
+    SY.build_syn_packet("192.168.1.20", 80, "192.168.1.10", 40000,
+                        "aa:bb:cc:dd:ee:ff", "")
+    _no_dst = False
+except ValueError:
+    _no_dst = True
+check("SYN：缺少目标 MAC 会被拒绝", _no_dst)
+
+_flood = SY.SynFlood("192.168.1.20", 80, _fake_iface,
+                     dst_mac="11:22:33:44:55:66",
+                     rate=0, duration=5.0, count=20, batch=32,
+                     dry_run=True)
+check("SYN：演练模式参数校验通过", _flood.check()[0], _flood.check()[1])
+check("SYN：演练模式能启动", _flood.start() is True)
+_flood_end = _time.time() + 3
+while _flood.is_running() and _time.time() < _flood_end:
+    _time.sleep(0.05)
+_flood.stop()
+_fsnap2 = _flood.snapshot()
+check("SYN：演练模式发满 20 个包且无失败",
+      _fsnap2["sent"] == 20 and _fsnap2["failed"] == 0,
+      f"sent={_fsnap2['sent']} failed={_fsnap2['failed']}")
+check("SYN：统计里标明是演练", _fsnap2["dry_run"] is True)
+
+_bad_flood = SY.SynFlood("192.168.1.20", 80, _fake_iface,
+                         dst_mac="", dry_run=True)
+check("SYN：没解析到 MAC 时拒绝启动", _bad_flood.check()[0] is False,
+      _bad_flood.check()[1])
+check("SYN：公网目标未授权时拒绝启动",
+      SY.SynFlood("8.8.8.8", 80, _fake_iface,
+                  dst_mac="11:22:33:44:55:66",
+                  dry_run=True).check()[0] is False)
+_est = SY.estimate(32, 2000)
+check("SYN：速率估算正确",
+      _est["pps"] == 2000 and _est["batch"] == 32
+      and _est["interval_ms"] == 16.0, str(_est))
+
+# --------------------------------------------------------------------------- #
 print(f"\n{'=' * 62}")
 print(f"=== {'ALL PASS' if not FAILS else str(len(FAILS)) + ' FAILED'} ===")
 for f in FAILS:

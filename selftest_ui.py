@@ -304,6 +304,150 @@ for cls, name in ((AM.ArpSpoofer, "ArpSpoofer"), (DS.DnsSpoofer, "DnsSpoofer"),
           callable(stop_attr), repr(stop_attr))
     check(f"{name} 使用独立的 _stop_evt", "_stop_evt" not in ("",) and True)
 
+# --------------------------------------------------------------------------- #
+section("9. 新页面：被动发现 / 变更监控 / 流量画像 / SYN Flood")
+import shutil as _shutil                              # noqa: E402
+import tempfile as _tempfile                          # noqa: E402
+
+from scapy.all import ARP as _ARP, Ether as _Ether   # noqa: E402
+from scapy.all import IP as _IP, Raw as _Raw, TCP as _TCP  # noqa: E402
+
+from core import flows as _FL                         # noqa: E402
+from core import store as _ST                         # noqa: E402
+
+# ---- 被动发现页：喂构造包，表格与审计都要能刷新 ----
+_pv_tab = win.tab_passive
+_pv_tab.collector.observe(
+    _Ether(src="02:00:00:00:00:11")
+    / _ARP(op=2, psrc="192.168.9.10", hwsrc="02:00:00:00:00:11",
+           pdst="192.168.9.1"))
+_pv_tab.collector.observe(
+    _Ether(src="02:00:00:00:00:12")
+    / _ARP(op=2, psrc="192.168.9.10", hwsrc="02:00:00:00:00:12",
+           pdst="192.168.9.1"))
+_pv_tab.refresh_view(force=True)
+check("被动发现页：资产表出现数据", _pv_tab.table_hosts.rowCount() == 1,
+      str(_pv_tab.table_hosts.rowCount()))
+check("被动发现页：告警表出现 IP 冲突", _pv_tab.table_alerts.rowCount() >= 1,
+      str(_pv_tab.table_alerts.rowCount()))
+check("被动发现页：事件流有内容", _pv_tab.table_events.rowCount() >= 2,
+      str(_pv_tab.table_events.rowCount()))
+_pv_tab.render_audit()
+check("被动发现页：审计结论可生成",
+      "审计结论" in _pv_tab.txt_audit.toPlainText(),
+      _pv_tab.txt_audit.toPlainText()[:40])
+
+_sent_ips = []
+_pv_tab.send_to_ports.connect(lambda ips: _sent_ips.extend(ips))
+_pv_tab.table_hosts.selectRow(0)
+_pv_tab._send_ports()
+check("被动发现页：选中项能送入端口扫描", _sent_ips == ["192.168.9.10"],
+      str(_sent_ips))
+
+# ---- 变更监控页：用临时库喂两份快照，验证历史与差异渲染 ----
+_mon_tab = win.tab_monitor
+_old_store = _mon_tab.store
+_tmp_mon_dir = _tempfile.mkdtemp(prefix="netops-ui-mon-")
+_tmp_store = _ST.SnapshotStore(os.path.join(_tmp_mon_dir, "ui.db"))
+_mon_tab.store = _tmp_store
+try:
+    _rows_a = [{"ip": "10.1.1.1", "mac": "aa", "hostname": "a"},
+               {"ip": "10.1.1.2", "mac": "bb", "hostname": "b"}]
+    _rows_b = [{"ip": "10.1.1.1", "mac": "aa", "hostname": "a2"},
+               {"ip": "10.1.1.3", "mac": "cc", "hostname": "c"}]
+    _tmp_store.save("assets", _rows_a, "第一份")
+    _tmp_store.save("assets", _rows_b, "第二份")
+    _mon_tab.refresh_history()
+    check("变更监控页：历史快照列表有 2 份",
+          _mon_tab.table_history.rowCount() == 2,
+          str(_mon_tab.table_history.rowCount()))
+
+    _spec = _ST.KINDS["assets"]
+    _mon_diff = _ST.diff_rows(_rows_a, _rows_b,
+                              key_field=_spec["key"],
+                              ignore_fields=_spec["ignore"])
+    _mon_diff.old_label = "第一份"
+    _mon_diff.new_label = "第二份"
+    _mon_tab._show_diff(_mon_diff)
+    check("变更监控页：差异表按行展开",
+          _mon_tab.table_diff.rowCount() == len(_mon_diff.rows()),
+          f"{_mon_tab.table_diff.rowCount()} / {len(_mon_diff.rows())}")
+    check("变更监控页：状态栏显示新增/消失/修改",
+          all(k in _mon_tab.lbl_changes.text()
+              for k in ("新增", "消失", "修改")),
+          _mon_tab.lbl_changes.text())
+
+    _mon_tab.table_history.selectRow(0)
+    _mon_tab.set_baseline()
+    check("变更监控页：能把选中快照设为基线",
+          "#" in _mon_tab.lbl_baseline.text(),
+          _mon_tab.lbl_baseline.text())
+
+    # 被动数据源直接读被动发现页的采集器，不额外发包
+    _mon_tab.passive_provider = lambda: _pv_tab.collector
+    _mon_tab.cmb_source.setCurrentIndex(1)
+    app.processEvents()
+    _built = _mon_tab._build_source()
+    check("变更监控页：被动数据源能构建", _built is not None,
+          str(_built))
+    if _built is not None:
+        _src_rows, _src_meta = _built[1]()
+        check("变更监控页：被动数据源返回资产行",
+              any(r.get("ip") == "192.168.9.10" for r in _src_rows),
+              str(_src_rows)[:80])
+    _mon_tab.cmb_source.setCurrentIndex(0)
+finally:
+    _mon_tab.store = _old_store
+    _tmp_store.close()
+    _shutil.rmtree(_tmp_mon_dir, ignore_errors=True)
+
+# ---- 流量画像页：离线流表直接渲染 ----
+_fl_tab = win.tab_flows
+_ft_ui = _FL.FlowTable(local_nets=["192.168.9.0/24"])
+_ft_ui.add(_Ether() / _IP(src="192.168.9.10", dst="93.184.216.34")
+           / _TCP(sport=51000, dport=80, flags="PA")
+           / _Raw(b"GET / HTTP/1.1\r\nHost: demo.local\r\n\r\n"))
+_ft_ui.add(_Ether() / _IP(src="93.184.216.34", dst="192.168.9.10")
+           / _TCP(sport=80, dport=51000, flags="A") / _Raw(b"OK"))
+_fl_tab.offline_table = _ft_ui
+_fl_tab.refresh_view(force=True)
+check("流量画像页：Top Talkers 有数据",
+      _fl_tab.table_talkers.rowCount() >= 1,
+      str(_fl_tab.table_talkers.rowCount()))
+check("流量画像页：Top 会话带 Host 识别",
+      any("demo.local" in _fl_tab.table_flows.item(r, 0).text()
+          for r in range(_fl_tab.table_flows.rowCount())),
+      str([_fl_tab.table_flows.item(r, 0).text()
+           for r in range(_fl_tab.table_flows.rowCount())]))
+check("流量画像页：应用分布有数据",
+      _fl_tab.table_apps.rowCount() >= 1,
+      str(_fl_tab.table_apps.rowCount()))
+check("流量画像页：统计栏显示包数",
+      "包 2" in _fl_tab.lbl_stats.text(), _fl_tab.lbl_stats.text())
+_fl_tab.clear_stats()
+check("流量画像页：清空统计后表格归零",
+      _fl_tab.table_talkers.rowCount() == 0
+      and _fl_tab.table_flows.rowCount() == 0)
+_fl_tab.offline_table = None
+
+# ---- SYN Flood 页：授权门槛 ----
+_sf_tab = win.tab_synflood
+_sf_tab.chk_auth.setChecked(False)
+_sf_tab._refresh_buttons()
+check("SYN Flood 页：未授权时开始按钮不可用",
+      not _sf_tab.btn_start.isEnabled())
+_sf_tab.chk_auth.setChecked(True)
+_sf_tab._refresh_buttons()
+check("SYN Flood 页：授权后开始按钮可用",
+      _sf_tab.btn_start.isEnabled())
+_sf_tab.chk_dry.setChecked(True)
+_sf_tab.ed_target.setText("192.168.1.20")
+_sf_tab.ed_dst_mac.setText("11:22:33:44:55:66")
+_sf_tab.sp_port.setValue(80)
+_sf_tab.btn_start.click()          # question 已被替换成 No
+app.processEvents()
+check("SYN Flood 页：确认框选「否」时不会启动", _sf_tab.flood is None)
+
 win.shutdown_children()
 try:
     if os.path.exists(crash_log_path()):
