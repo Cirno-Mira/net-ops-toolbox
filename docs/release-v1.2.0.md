@@ -79,4 +79,5 @@ SNMP 设备信息、变更监控、流量画像与 SYN Flood 五个模块，并�
 本工具仅可用于本人拥有或已获得书面授权的网络与设备。压力测试、SYN Flood、
 DHCP 测试等功能会实际占用目标资源，请提前确认影响范围，并在业务低峰期使用。
 
-完整功能说明、使用流程与常见问题请参阅 [README](../README.md)。
+完整功能说明、使用流程与常见问题请参阅
+[项目 README](https://github.com/Cirno-Mira/net-ops-toolbox#readme)。
